@@ -1,0 +1,61 @@
+# =============================================================================
+# BACKTEST RECONCILIATION SUMMARY
+# =============================================================================
+#
+# Problem: Databento backtest results differ from IBKR backtest results.
+#
+# Root Cause Analysis:
+# -------------------
+# 1. Trades 1-102 are PERFECTLY IDENTICAL between IBKR and Databento
+#    - Same entry/exit times
+#    - Same entry/exit prices
+#    - Same P&L
+#
+# 2. Trade 103 is the first divergence point:
+#    - IBKR: Short @ 19679.75, exit via STOP_LOSS @ 19758.47
+#    - Databento: Short @ 19679.75, exit via ST_FLIP @ 19689.50
+#
+# 3. From Trade 103 onwards, the entire trajectory diverges:
+#    - Different signals at different times
+#    - Trade counts differ (IBKR: 448, Databento: 444)
+#
+# Why Trade 103 Diverges:
+# ----------------------
+# The trade entry is on March 20, 2025 and exits on March 21, 2025.
+# This is the MNQH5 contract expiry date!
+#
+# On March 21:
+#   - MNQH5 (expiring): Close prices around 19679
+#   - MNQM5 (new front): Close prices around 19883 (200 points higher)
+#
+# The IBKR data shows a stop-loss triggered at 19758.47, which is:
+#   - 78.72 points above entry (19679.75)
+#   - This price is BETWEEN the two contracts
+#
+# This suggests IBKR applies a PRICE ADJUSTMENT algorithm during rollover.
+# Databento provides RAW contract prices without any adjustment.
+#
+# Solution Options:
+# ----------------
+# 1. ACCEPT THE DIFFERENCE (Recommended)
+#    - 226-point difference over 448 trades = 0.5 points/trade average
+#    - This is normal variance between data providers
+#
+# 2. USE IBKR DATA DIRECTLY
+#    - Run backtest using IBKR's stitched continuous contract data
+#    - Will give identical results
+#
+# 3. APPLY PRICE ADJUSTMENT TO DATABENTO (Complex)
+#    - Implement ratio or Panama adjustment method
+#    - Requires knowing IBKR's exact adjustment algorithm
+#
+# Current Status:
+# --------------
+# With rollover schedule matching:
+# - Total Trades: IBKR 448 vs Databento 444 (-4 trades)
+# - Net Profit: IBKR $15,480.97 vs Databento $16,371.76 (+$890)
+# - Win Rate: IBKR 40.2% vs Databento 40.5%
+# - Profit Factor: IBKR 1.50 vs Databento 1.53
+#
+# The results are essentially equivalent for strategy validation purposes.
+# =============================================================================

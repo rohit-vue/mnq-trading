@@ -1,0 +1,32 @@
+# =============================================================================
+# MNQ Trading System Dependencies
+# =============================================================================
+
+# IBKR API - ib_async is the maintained successor to ib_insync
+# ib_insync is deprecated (archived). ib_async is a drop-in replacement.
+ib_async>=1.0.0
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Configuration
+PyYAML>=6.0
+python-dotenv>=1.0.0
+
+# Timezone handling
+pytz>=2023.3
+
+# Telegram notifications (async HTTP requests)
+aiohttp>=3.9.0
+
+# Async support (included with Python 3.11+)
+# asyncio is built-in
+
+# Optional: For visualization (if needed)
+# matplotlib>=3.7.0
+# plotly>=5.15.0
+
+# Optional: For web interface (future)
+# fastapi>=0.100.0
+# uvicorn>=0.22.0

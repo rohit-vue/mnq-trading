@@ -1,0 +1,123 @@
+# =============================================================================
+# IBKR CONNECTION CONFIGURATION
+# =============================================================================
+
+connection:
+  # TWS or IB Gateway host
+  host: "127.0.0.1"
+  
+  # Ports for different connection types
+  ports:
+    tws_live: 7496
+    tws_paper: 7497
+    gateway_live: 4001
+    gateway_paper: 4002
+  
+  # Default connection
+  default_mode: "paper"           # Options: "paper", "live"
+  default_gateway: "tws"       # Options: "tws", "gateway" (use "gateway" for 24/7 via IB Gateway)
+  
+  # Client ID (ensure unique across all connected apps)
+  client_id: 1
+
+# -----------------------------------------------------------------------------
+# DATA SUBSCRIPTION SETTINGS
+# -----------------------------------------------------------------------------
+data:
+  # Historical data settings
+  historical:
+    bar_type: "TRADES"            # MIDPOINT, BID, ASK, TRADES
+    use_rth_only: false           # false = include ETH data
+    
+  # Real-time data settings
+  realtime:
+    method: "reqHistoricalData"   # reqHistoricalData with keepUpToDate
+    keep_up_to_date: true         # Stream updates to historical data
+    
+  # Handle delayed data (if no live subscription)
+  delayed_data:
+    accept: true                  # Accept delayed data if live unavailable
+    warn_user: true               # Show warning when using delayed
+
+# -----------------------------------------------------------------------------
+# PACING LIMITS (IBKR enforced)
+# -----------------------------------------------------------------------------
+pacing:
+  # Historical data requests
+  historical_requests_per_10_min: 60
+  identical_request_interval_sec: 15
+  
+  # Order rate limits
+  orders_per_second: 50
+  
+  # Automatic pacing compliance
+  auto_throttle: true
+
+# -----------------------------------------------------------------------------
+# RECONNECTION SETTINGS
+# -----------------------------------------------------------------------------
+reconnection:
+  enabled: true
+  max_attempts: 0                   # 0 = infinite (24/7 operation)
+  initial_delay_sec: 5
+  max_delay_sec: 60
+  backoff_multiplier: 2.0
+  
+  # On reconnect actions
+  on_reconnect:
+    resync_positions: true
+    resync_orders: true
+    cancel_pending_orders: false
+
+# =============================================================================
+# IB GATEWAY DAILY RESTART GUIDE
+# =============================================================================
+#
+# IMPORTANT: IB Gateway MUST restart once per day (IBKR regulatory requirement).
+# This CANNOT be disabled. But the bot handles it automatically!
+#
+# What happens during daily restart:
+#   1. Gateway disconnects (typically takes 1-3 minutes)
+#   2. Gateway auto-restarts and logs back in
+#   3. Bot detects disconnect and starts retry loop
+#   4. Bot reconnects when Gateway is back
+#   5. Bot resyncs positions, data feeds, and resumes trading
+#
+# RECOMMENDED SETUP FOR 24/7 OPERATION:
+# ======================================
+#
+# Step 1: Set Auto-Restart Time in IB Gateway
+#   - Open IB Gateway → Configure → Settings → Lock and Exit
+#   - Set "Auto restart" time to: 17:00 ET (5:00 PM ET)
+#   - This is during CME daily maintenance (5:00-6:00 PM ET)
+#   - MNQ futures don't trade during this hour anyway!
+#
+#   Time zones for 5:00 PM ET:
+#     - UAE (GST/UTC+4):   01:00 AM next day
+#     - Pakistan (PKT/UTC+5): 02:00 AM next day
+#     - UK (GMT/UTC+0):    10:00 PM same day
+#     - IST (UTC+5:30):    02:30 AM next day
+#
+# Step 2: Enable Auto-Login in IB Gateway
+#   - Configure → Settings → Lock and Exit
+#   - Check "Auto logon" or "Auto restart"
+#   - Gateway will auto-login after restart
+#
+# Step 3: Disable 2FA for API (optional but recommended)
+#   - In IBKR Account Management → Settings → Security
+#   - You can disable 2FA specifically for TWS/Gateway login
+#   - Keep 2FA enabled for web Account Management (for security)
+#   - Alternative: Create a separate user for automation (no 2FA)
+#
+# Step 4: Weekly manual login
+#   - IBKR requires manual login approximately once per week
+#   - Typically Sunday around 1:00 AM ET
+#   - Security tokens get refreshed
+#   - You'll need to log in manually once on the computer
+#   - The bot will auto-reconnect after you log back in
+#
+# KEEP YOUR COMPUTER ON:
+#   - Disable sleep/hibernate mode
+#   - Use a UPS (Uninterruptible Power Supply) if possible
+#   - Or run the bot on a VPS/cloud server for max uptime
+#

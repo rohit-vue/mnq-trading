@@ -1,0 +1,18 @@
+# =============================================================================
+# RISK MANAGEMENT CONFIGURATION
+# =============================================================================
+# Simplified - main strategy parameters are in strategy.yaml
+
+# -----------------------------------------------------------------------------
+# POSITION SIZING
+# -----------------------------------------------------------------------------
+position_sizing:
+  mode: "fixed"               # Fixed number of contracts per trade
+  fixed_contracts: 1          # Number of contracts per trade
+
+# -----------------------------------------------------------------------------
+# SLIPPAGE & COMMISSION ESTIMATES (for backtesting)
+# -----------------------------------------------------------------------------
+backtesting:
+  slippage_ticks: 1               # Assumed slippage per side (entry + exit)
+  commission_per_contract: 0.62   # IBKR commission per contract per side

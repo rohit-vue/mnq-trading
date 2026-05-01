@@ -1,0 +1,134 @@
+# =============================================================================
+# MNQ SUPERTREND + EMA STRATEGY CONFIGURATION
+# Mirrors TradingView Pine Script v6 logic EXACTLY
+# Long vs short: separate Supertrend, risk (SL/TP), and ADX blocks.
+# If you omit long_* / short_* keys, legacy supertrend / risk / adx are used for both sides.
+# =============================================================================
+
+strategy:
+  name: "MNQ EMA Supertrend Strategy"
+  version: "1.0.0"
+  description: "Multi-timeframe trend following with Supertrend (10m) + EMA200 (1H) filter"
+
+# -----------------------------------------------------------------------------
+# SUPERTREND — per-side entry/exit series
+# -----------------------------------------------------------------------------
+long_supertrend_entry:
+  atr_length: 10
+  multiplier: 4
+
+long_supertrend_exit:
+  atr_length: 10
+  multiplier: 4
+
+short_supertrend_entry:
+  atr_length: 10
+  multiplier: 5
+
+short_supertrend_exit:
+  atr_length: 10
+  multiplier: 4
+
+# Side-level aliases (optional): used when *_entry / *_exit are missing
+long_supertrend:
+  atr_length: 12
+  multiplier: 4
+
+short_supertrend:
+  atr_length: 12
+  multiplier: 5
+
+# Legacy (optional): used only when long_supertrend / short_supertrend are missing
+supertrend:
+  atr_length: 12        # ATR Length for Supertrend calculation
+  multiplier: 4       # Factor for band calculation
+
+# -----------------------------------------------------------------------------
+# EMA FILTER PARAMETERS (1-hour timeframe)
+# Pine Script reference: lines 21-22
+# When price is within margin% of EMA 200, we wait for 1H close to confirm direction
+# -----------------------------------------------------------------------------
+ema:
+  length: 200           # EMA period (calculated on 1H timeframe)
+  timeframe: "1H"       # Higher timeframe for EMA calculation
+
+# -----------------------------------------------------------------------------
+# TIMEFRAME CONFIGURATION
+# primary = bar size for Supertrend (chart/strategy execution). Options: 5m, 10m, 15m, 30m, 45m, 1h
+# ema_filter = always 1H; EMA200 is always calculated on 1-hour bars
+# -----------------------------------------------------------------------------
+timeframes:
+  primary: "10m"        # Supertrend bar size (5m, 10m, 15m, 30m, 45m, 1h)
+  ema_filter: "1H"      # EMA always on 1H (unchanged)
+
+# -----------------------------------------------------------------------------
+# RISK — stop / take profit per side
+# -----------------------------------------------------------------------------
+long_risk:
+  stop_loss_pct: 0.35
+  take_profit_pct: 3
+
+short_risk:
+  stop_loss_pct: 0.35
+  take_profit_pct: 2
+
+# Legacy (optional): used when long_risk / short_risk are missing
+risk:
+  stop_loss_pct: 0.35  # Stop loss as percentage from entry
+  take_profit_pct: 4  # Take profit as percentage from entry
+
+# -----------------------------------------------------------------------------
+# ADX CONFIRMATION PARAMETERS (10-minute timeframe)
+# Used for both BUY and SELL entries - requires ADX >= 20 for entry confirmation
+# Pine Script: [diPlus, diMinus, adxValue] = ta.dmi(diLen, adxLen)
+# Set use_adx: false to backtest without ADX (supporting indicator) for comparison
+# -----------------------------------------------------------------------------
+long_adx:
+  use_adx: true
+  di_length: 14
+  adx_smoothing: 14
+  threshold: 24
+  consecutive_candles: 5
+
+short_adx:
+  use_adx: true
+  di_length: 14
+  adx_smoothing: 14
+  threshold: 25
+  consecutive_candles: 5
+
+# Legacy (optional): used when long_adx / short_adx are missing
+adx:
+  use_adx: true
+  di_length: 14
+  adx_smoothing: 14
+  threshold: 24
+  consecutive_candles: 5
+
+# -----------------------------------------------------------------------------
+# VOLUME CONFIRMATION (primary timeframe only)
+# 20-period SMA of volume; entry only if volume exceeds MA on trigger bar or within
+# the next (volume_candle_lookahead - 1) bars. Set lookahead to 1 = trigger bar only.
+# -----------------------------------------------------------------------------
+volume_check: false       # If true, require volume > 20-bar volume MA (with lookahead window)
+volume_ma_period: 20     # SMA period for volume (set 50 for 50MA, etc.; min 1)
+volume_candle_lookahead: 3  # Total primary bars in window including trigger (min 1; 0 treated as 1)
+
+# -----------------------------------------------------------------------------
+# EXECUTION SETTINGS
+# Pine Script reference: lines 2-6
+# -----------------------------------------------------------------------------
+execution:
+  pyramiding: 0                       # Max concurrent positions (0 = no stacking)
+  process_orders_on_close: true       # Execute signals at bar close only
+  initial_capital: 100000             # Starting capital for backtesting
+  independent_books: true             # Backtest long/short in isolated books, then merge
+
+# -----------------------------------------------------------------------------
+# BAR CLOSE LOGIC
+# This ensures we only act on confirmed candle closes
+# No intrabar execution (matches Pine Script behavior)
+# -----------------------------------------------------------------------------
+bar_close:
+  wait_for_confirmation: true
+  lookahead_protection: true          # barmerge.lookahead_off equivalent

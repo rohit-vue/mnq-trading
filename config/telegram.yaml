@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# TELEGRAM NOTIFICATION CONFIGURATION
+# =============================================================================
+# Secrets belong in .env (see .env.example): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Values here are optional fallbacks if env vars are unset.
+
+telegram:
+  enabled: true
+
+  # Fallback only — prefer TELEGRAM_BOT_TOKEN in .env
+  bot_token: ""
+
+  # Fallback only — prefer TELEGRAM_CHAT_ID in .env
+  chat_id: ""
+
+# -----------------------------------------------------------------------------
+# NOTIFICATION SETTINGS
+# -----------------------------------------------------------------------------
+notifications:
+  bot_start: true
+  bot_stop: true
+  trade_entry: true
+  trade_exit: true
+  running_pnl:
+    enabled: true
+    interval_seconds: 3600
+  connection_status: true
+  errors: true

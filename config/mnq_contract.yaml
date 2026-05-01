@@ -1,0 +1,80 @@
+# =============================================================================
+# MNQ (MICRO E-MINI NASDAQ-100) CONTRACT SPECIFICATION
+# =============================================================================
+
+contract:
+  symbol: "MNQ"
+  full_name: "Micro E-mini Nasdaq-100 Futures"
+  exchange: "CME"
+  currency: "USD"
+  
+  # Contract specifications
+  multiplier: 2               # $2 per point
+  tick_size: 0.25             # Minimum price movement
+  tick_value: 0.50            # Value per tick ($0.25 * 2 = $0.50)
+  
+  # For IBKR API
+  sec_type: "FUT"
+  
+# -----------------------------------------------------------------------------
+# SYMBOL MAPPING
+# TradingView uses continuous contract notation
+# IBKR requires specific contract months
+# -----------------------------------------------------------------------------
+symbol_mapping:
+  tradingview: "MNQ1!"        # Continuous front-month
+  ibkr_root: "MNQ"            # Root symbol for IBKR
+
+# -----------------------------------------------------------------------------
+# FUTURES ROLLOVER CONFIGURATION
+# Auto-roll to next front-month contract
+# -----------------------------------------------------------------------------
+rollover:
+  enabled: true
+  method: "front_month_auto"
+  days_before_expiry: 3       # Roll 3 days before expiration
+  
+  # Contract month codes
+  month_codes:
+    - "H"   # March
+    - "M"   # June
+    - "U"   # September
+    - "Z"   # December
+
+# -----------------------------------------------------------------------------
+# TRADING HOURS (ALL TIMES IN US/Eastern)
+# -----------------------------------------------------------------------------
+trading_hours:
+  # Regular Trading Hours
+  rth:
+    start: "09:30"
+    end: "16:00"
+    timezone: "US/Eastern"
+    
+  # Extended Trading Hours (Sunday-Friday)
+  eth:
+    start: "18:00"            # Sunday 6 PM
+    end: "17:00"              # Friday 5 PM (next day)
+    daily_maintenance:
+      start: "17:00"
+      end: "18:00"
+    timezone: "US/Eastern"
+
+# -----------------------------------------------------------------------------
+# SESSION FILTER OPTIONS
+# User can choose which session to trade
+# -----------------------------------------------------------------------------
+session_filter:
+  options:
+    - "RTH"                   # Regular hours only
+    - "ETH"                   # Extended hours only
+    - "ALL"                   # Both sessions
+  default: "ALL"
+
+# -----------------------------------------------------------------------------
+# MARGIN REQUIREMENTS (approximate, for reference)
+# Actual margins determined by IBKR in real-time
+# -----------------------------------------------------------------------------
+margin:
+  initial_estimate: 1500      # Approximate initial margin per contract
+  maintenance_estimate: 1350  # Approximate maintenance margin
