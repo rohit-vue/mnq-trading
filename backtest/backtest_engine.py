@@ -537,6 +537,12 @@ class BacktestEngine:
             multiplier=self.config.multiplier,
         )
 
+        # Keep parent engine state in sync so callers using engine.get_trade_summary()
+        # receive the merged long+short trades in independent-books mode.
+        self.trades = merged_trades
+        self.signal_log = signals_df.to_dict("records") if not signals_df.empty else []
+        self._run_df = df_10m
+
         return BacktestResult(
             config=self.config,
             trades=merged_trades,

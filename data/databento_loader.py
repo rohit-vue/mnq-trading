@@ -95,7 +95,8 @@ def load_databento_data(
     start_date: datetime,
     end_date: datetime,
     symbol_filter: str = "MNQ",
-    data_dir: str = DATABENTO_DIR
+    data_dir: str = DATABENTO_DIR,
+    contract_root: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Load Databento CSV files and combine into single DataFrame.
@@ -116,6 +117,7 @@ def load_databento_data(
     pd.DataFrame
         Combined 1-minute OHLCV data
     """
+    root = (contract_root or symbol_filter or "MNQ").upper()
     files = get_files_for_date_range(start_date, end_date, data_dir)
     
     if not files:
@@ -135,7 +137,7 @@ def load_databento_data(
         
         df = pd.read_csv(file_path)
         
-        # Filter by symbol (e.g., MNQ contracts: MNQH5, MNQM5, etc.)
+        # Filter by symbol root (e.g., MNQH5 / MGCM6)
         if symbol_filter:
             df = df[df['symbol'].str.startswith(symbol_filter)]
         
@@ -175,13 +177,18 @@ def load_databento_data(
     combined_df['timestamp'] = combined_df['timestamp'].dt.tz_localize(None)
     
     # === FILTER OUT BAD PRICE DATA ===
-    # MNQ prices should be in a reasonable range (10000-50000 for this period)
+    # Keep a broad, root-aware sanity range to catch corrupted rows.
+    price_bounds = {
+        "MNQ": (10_000, 50_000),
+        "MGC": (500, 20_000),
+    }
+    min_price, max_price = price_bounds.get(root, (0, 10_000_000))
     initial_count = len(combined_df)
     combined_df = combined_df[
-        (combined_df['close'] >= 10000) & 
-        (combined_df['close'] <= 50000) &
-        (combined_df['open'] >= 10000) &
-        (combined_df['open'] <= 50000)
+        (combined_df['close'] >= min_price) & 
+        (combined_df['close'] <= max_price) &
+        (combined_df['open'] >= min_price) &
+        (combined_df['open'] <= max_price)
     ]
     filtered_count = initial_count - len(combined_df)
     if filtered_count > 0:
@@ -189,11 +196,10 @@ def load_databento_data(
         logger.warning(f"Filtered out {filtered_count} rows with invalid price data")
     
     # === CREATE STITCHED CONTINUOUS CONTRACT ===
-    # Use same contract boundary generation as IBKR stitcher:
-    # quarter boundaries at end of 3rd Friday.
+    # Use same contract boundary generation as IBKR stitcher.
     print("\n[INFO] Creating stitched continuous contract (CME expiry boundaries)...")
     from data.contract_stitcher import get_contracts_for_date_range
-    contracts_for_range = get_contracts_for_date_range(start_date, end_date)
+    contracts_for_range = get_contracts_for_date_range(start_date, end_date, root=root)
     
     def get_front_month_contract(timestamp):
         """Get the front-month contract for a given timestamp.
@@ -227,10 +233,10 @@ def load_databento_data(
         combined_df['timestamp'] = combined_df['timestamp'].dt.tz_convert('US/Eastern')
         combined_df['timestamp'] = combined_df['timestamp'].dt.tz_localize(None)
         combined_df = combined_df[
-            (combined_df['close'] >= 10000) & 
-            (combined_df['close'] <= 50000) &
-            (combined_df['open'] >= 10000) &
-            (combined_df['open'] <= 50000)
+            (combined_df['close'] >= min_price) & 
+            (combined_df['close'] <= max_price) &
+            (combined_df['open'] >= min_price) &
+            (combined_df['open'] <= max_price)
         ]
         combined_df['front_month'] = combined_df['timestamp'].apply(get_front_month_contract)
         # Match by prefix (MNQH5 matches MNQH5)
@@ -326,6 +332,7 @@ def prepare_databento_for_backtest(
     end_date: datetime,
     symbol_filter: str = "MNQ",
     data_dir: str = DATABENTO_DIR,
+    contract_root: Optional[str] = None,
     # Primary timeframe (from strategy timeframes.primary, e.g. "10min", "15min")
     primary_resample_rule: str = "10min",
     # Strategy parameters (from config)
@@ -401,7 +408,13 @@ def prepare_databento_for_backtest(
     print(f"[INFO] (Backtest period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
     
     # Load 1M data WITH warmup period
-    df_1m = load_databento_data(data_start_date, end_date, symbol_filter, data_dir)
+    df_1m = load_databento_data(
+        data_start_date,
+        end_date,
+        symbol_filter=symbol_filter,
+        data_dir=data_dir,
+        contract_root=contract_root,
+    )
     
     # Resample to primary timeframe (e.g. 10m, 15m)
     df_10m = resample_1m_to_primary(df_1m, resample_rule=primary_resample_rule)

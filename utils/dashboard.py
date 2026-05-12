@@ -194,13 +194,13 @@ class TradingDashboard:
         lines.append("")
         
         # Status bar
-        conn_status = "🟢 CONNECTED" if self.is_connected else "🔴 DISCONNECTED"
+        conn_status = "[OK] CONNECTED" if self.is_connected else "[X] DISCONNECTED"
         lines.append(f"  Status: {conn_status}    Time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
         lines.append("")
         
         # Current Market Status
         lines.append("-" * 70)
-        lines.append("  📊 MARKET STATUS")
+        lines.append("  MARKET STATUS")
         lines.append("-" * 70)
         lines.append(f"  Symbol: {self.symbol}")
         lines.append(f"  Price:  {self.current_price:,.2f}")
@@ -214,7 +214,7 @@ class TradingDashboard:
         
         # Active Position
         lines.append("-" * 70)
-        lines.append("  📈 ACTIVE POSITION")
+        lines.append("  ACTIVE POSITION")
         lines.append("-" * 70)
         
         if self.active_trade:
@@ -233,7 +233,7 @@ class TradingDashboard:
         
         # P&L Summary
         lines.append("-" * 70)
-        lines.append("  💰 P&L SUMMARY")
+        lines.append("  P&L SUMMARY")
         lines.append("-" * 70)
         
         realized_color = "+" if self.realized_pnl >= 0 else ""
@@ -249,7 +249,7 @@ class TradingDashboard:
         # Account Info
         if self.account_value > 0:
             lines.append("-" * 70)
-            lines.append("  🏦 ACCOUNT")
+            lines.append("  ACCOUNT")
             lines.append("-" * 70)
             lines.append(f"  Net Liquidation: ${self.account_value:,.2f}")
             lines.append(f"  Buying Power:    ${self.buying_power:,.2f}")
@@ -258,7 +258,7 @@ class TradingDashboard:
         # Recent Trades
         if self.recent_trades:
             lines.append("-" * 70)
-            lines.append("  📋 RECENT TRADES (Last 5)")
+            lines.append("  RECENT TRADES (Last 5)")
             lines.append("-" * 70)
             
             for trade in self.recent_trades:
@@ -304,16 +304,16 @@ class TradingDashboard:
         now = datetime.now(self.timezone).strftime('%H:%M:%S')
         
         if event_type == "ENTRY":
-            icon = "🟢"
+            icon = "[+]"
         elif event_type == "EXIT":
-            icon = "🔴"
+            icon = "[-]"
         elif event_type == "SIGNAL":
-            icon = "📊"
+            icon = "[*]"
         elif event_type == "ERROR":
-            icon = "❌"
+            icon = "[X]"
         elif event_type == "WARNING":
-            icon = "⚠️"
+            icon = "[!]"
         else:
-            icon = "ℹ️"
+            icon = "[i]"
         
         print(f"  {icon} [{now}] {event_type}: {message}")

@@ -11,7 +11,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple
 import asyncio
 import logging
 
@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 QUARTER_MONTHS = [3, 6, 9, 12]
-MONTH_CODE = {3: "H", 6: "M", 9: "U", 12: "Z"}
+MNQ_MONTH_CODE = {3: "H", 6: "M", 9: "U", 12: "Z"}
+MGC_BIMONTHLY_MONTHS = [2, 4, 6, 8, 10, 12]
+MGC_MONTH_CODE = {2: "G", 4: "J", 6: "M", 8: "Q", 10: "V", 12: "Z"}
 
 
 def _third_friday(year: int, month: int) -> datetime:
@@ -41,23 +43,44 @@ def _expiry_boundary_datetime(year: int, month: int) -> datetime:
     return datetime(expiry_day.year, expiry_day.month, expiry_day.day, 23, 59, 59)
 
 
-def _prev_quarter(year: int, month: int) -> Tuple[int, int]:
-    if month == 3:
-        return year - 1, 12
-    if month == 6:
-        return year, 3
-    if month == 9:
-        return year, 6
-    return year, 9  # month == 12
+def _third_to_last_business_day(year: int, month: int) -> datetime:
+    """
+    Return the third-to-last business day (Mon-Fri) for a given month.
+    """
+    if month == 12:
+        cursor = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        cursor = datetime(year, month + 1, 1) - timedelta(days=1)
+
+    business_days_seen = 0
+    while True:
+        if cursor.weekday() < 5:  # Monday-Friday
+            business_days_seen += 1
+            if business_days_seen == 3:
+                return cursor
+        cursor -= timedelta(days=1)
 
 
-def _contract_symbol(root: str, year: int, month: int) -> str:
-    return f"{root}{MONTH_CODE[month]}{year % 10}"
+def _mgc_expiry_boundary_datetime(year: int, month: int) -> datetime:
+    expiry_day = _third_to_last_business_day(year, month)
+    return datetime(expiry_day.year, expiry_day.month, expiry_day.day, 23, 59, 59)
+
+
+def _prev_cycle_month(year: int, month: int, cycle_months: List[int]) -> Tuple[int, int]:
+    idx = cycle_months.index(month)
+    if idx == 0:
+        return year - 1, cycle_months[-1]
+    return year, cycle_months[idx - 1]
+
+
+def _contract_symbol(root: str, year: int, month: int, month_code: dict) -> str:
+    return f"{root}{month_code[month]}{year % 10}"
 
 
 def get_contracts_for_date_range(
     start_date: datetime,
-    end_date: datetime
+    end_date: datetime,
+    root: str = "MNQ",
 ) -> List[Tuple[str, datetime, datetime]]:
     """
     Determine which MNQ contracts cover the given date range.
@@ -75,6 +98,19 @@ def get_contracts_for_date_range(
         List of (contract_symbol, contract_start, contract_end) tuples
     """
     contracts_needed = []
+    root = (root or "MNQ").upper()
+    if root == "MNQ":
+        cycle_months = QUARTER_MONTHS
+        month_code = MNQ_MONTH_CODE
+        boundary_fn = _expiry_boundary_datetime
+        expiry_label_fn = _third_friday
+    elif root == "MGC":
+        cycle_months = MGC_BIMONTHLY_MONTHS
+        month_code = MGC_MONTH_CODE
+        boundary_fn = _mgc_expiry_boundary_datetime
+        expiry_label_fn = _third_to_last_business_day
+    else:
+        raise ValueError(f"Unsupported contract root: {root}")
 
     # Make dates timezone-naive for comparison
     if hasattr(start_date, 'tzinfo') and start_date.tzinfo is not None:
@@ -92,17 +128,17 @@ def get_contracts_for_date_range(
     max_year = end_date_naive.year + 1
 
     for year in range(min_year, max_year + 1):
-        for month in QUARTER_MONTHS:
-            prev_y, prev_m = _prev_quarter(year, month)
-            contract_start = _expiry_boundary_datetime(prev_y, prev_m)
-            contract_end = _expiry_boundary_datetime(year, month)
+        for month in cycle_months:
+            prev_y, prev_m = _prev_cycle_month(year, month, cycle_months)
+            contract_start = boundary_fn(prev_y, prev_m)
+            contract_end = boundary_fn(year, month)
 
             # Check overlap against requested range
             if contract_end >= start_date_naive and contract_start <= end_date_naive:
                 fetch_start = max(contract_start, start_date_naive)
                 fetch_end = min(contract_end, end_date_naive)
-                symbol = _contract_symbol("MNQ", year, month)
-                expiry = _third_friday(year, month).strftime("%Y%m%d")
+                symbol = _contract_symbol(root, year, month, month_code)
+                expiry = expiry_label_fn(year, month).strftime("%Y%m%d")
                 contracts_needed.append((symbol, fetch_start, fetch_end, expiry))
 
     # Sort by start datetime
@@ -114,7 +150,9 @@ async def fetch_stitched_data(
     ib_client,
     start_date: datetime,
     end_date: datetime,
-    bar_size: str = "10 mins"
+    bar_size: str = "10 mins",
+    root: str = "MNQ",
+    exchange: str = "CME",
 ) -> pd.DataFrame:
     """
     Fetch historical data from multiple MNQ contracts and stitch together.
@@ -138,7 +176,7 @@ async def fetch_stitched_data(
     from ib_async import Future
     
     # Get list of contracts needed
-    contracts_needed = get_contracts_for_date_range(start_date, end_date)
+    contracts_needed = get_contracts_for_date_range(start_date, end_date, root=root)
     
     if not contracts_needed:
         logger.error(f"No contracts found for date range {start_date} to {end_date}")
@@ -157,8 +195,8 @@ async def fetch_stitched_data(
         is_expired = datetime.strptime(expiry, '%Y%m%d') < datetime.now()
         
         contract = Future(
-            symbol='MNQ',
-            exchange='CME',
+            symbol=root.upper(),
+            exchange=exchange,
             currency='USD',
             lastTradeDateOrContractMonth=expiry,
             includeExpired=is_expired

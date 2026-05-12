@@ -4,7 +4,7 @@ from pathlib import Path
 # =========================
 # CONFIG
 # =========================
-INPUT_CSV = "glbx-mdp3-20170101-20260226.ohlcv-1m.csv"
+INPUT_CSV = "glbx-mdp3-20180101-20260506.ohlcv-1m.csv"
 OUTPUT_DIR = Path("monthly_splits")
 CHUNK_SIZE = 5_000_000  # safe for large files
 

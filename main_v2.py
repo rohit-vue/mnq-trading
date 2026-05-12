@@ -20,8 +20,10 @@ Modes:
 
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timedelta
+from typing import Any, Optional
 from pathlib import Path
 import yaml
 import pytz
@@ -60,6 +62,141 @@ logging.getLogger('backtest.backtest_engine').setLevel(logging.INFO)
 logging.getLogger('ib_async.wrapper').setLevel(logging.WARNING)
 logging.getLogger('ib_async.client').setLevel(logging.WARNING)
 logging.getLogger('ib_async.ib').setLevel(logging.WARNING)
+
+
+def contract_label_from_ib(contract: Any) -> str:
+    """Human-readable contract id for trading.log lines."""
+    ls = getattr(contract, "localSymbol", None)
+    if ls:
+        return str(ls)
+    sym = getattr(contract, "symbol", None)
+    return str(sym) if sym else "UNKNOWN"
+
+
+def resolve_ib_client_id(conn_cfg: dict) -> int:
+    """
+    IBKR allows one socket per (host, port, client_id). Error 326 means ID is already in use.
+    Override with env IB_CLIENT_ID to avoid clashes with another bot, TWS chart, or IDE session.
+    """
+    raw = os.environ.get("IB_CLIENT_ID", "").strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        return int(conn_cfg.get("client_id", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def seed_dashboard_prices_from_feed(dashboard: Any, feed: Any) -> None:
+    """Set dashboard price/time from buffered OHLC so PRICE_POLL is non-zero before the next tick."""
+    if feed is None:
+        return
+    df = feed.get_dataframe()
+    if df is None or len(df) == 0:
+        return
+    row = df.iloc[-1]
+    try:
+        dashboard.update_price(float(row["close"]), row.name)
+    except Exception:
+        try:
+            dashboard.update_price(float(row["close"]))
+        except Exception:
+            pass
+
+
+def log_price_poll_snapshot(
+    mode: str,
+    contract_label: str,
+    dashboard: Any,
+    *,
+    feed: Any = None,
+    ib_connected: Optional[bool] = None,
+) -> None:
+    """
+    Log once per dashboard refresh (~5s).
+
+    - stream_price: last value passed to dashboard.update_price (IB forming-bar updates).
+    - df_last_*: last row of the feed's OHLC buffer (updates with streaming).
+    - prev_completed_*: last fully closed primary bar (iloc[-2]); strategy uses this for signals.
+    """
+    lb = dashboard.last_bar_time
+    if lb is None:
+        lb_text = "n/a"
+    elif hasattr(lb, "isoformat"):
+        lb_text = lb.isoformat()
+    else:
+        lb_text = str(lb)
+
+    n_bars = 0
+    df_last_c = float("nan")
+    df_last_ts = "n/a"
+    prev_closed_c = float("nan")
+    prev_closed_ts = "n/a"
+
+    if feed is not None:
+        df = feed.get_dataframe()
+        if df is not None and len(df) > 0:
+            n_bars = len(df)
+            lr = df.iloc[-1]
+            df_last_c = float(lr["close"])
+            ts = lr.name
+            df_last_ts = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+        closed = feed.get_latest_closed_bar()
+        if closed:
+            prev_closed_c = float(closed["close"])
+            dt = closed["datetime"]
+            prev_closed_ts = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+
+    conn_ib = ib_connected if ib_connected is not None else dashboard.is_connected
+
+    logger.info(
+        "PRICE_POLL | mode=%s | contract=%s | stream_price=%.4f | strategy_last_bar_ts=%s | "
+        "bars=%s | df_last_close=%.4f | df_last_ts=%s | prev_completed_close=%.4f | prev_completed_ts=%s | "
+        "ST=%s | EMA_side=%s | ADX=%.2f | ib_connected=%s | dashboard_conn_flag=%s",
+        mode,
+        contract_label,
+        float(dashboard.current_price),
+        lb_text,
+        n_bars,
+        df_last_c,
+        df_last_ts,
+        prev_closed_c,
+        prev_closed_ts,
+        dashboard.st_direction,
+        dashboard.ema_status,
+        float(dashboard.adx_value),
+        conn_ib,
+        dashboard.is_connected,
+    )
+
+
+def log_bar_close_snapshot(mode: str, contract_label: str, bar: Any) -> None:
+    """Log each primary bar close processed by the strategy (aligned row)."""
+    ts = bar.name
+    ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+
+    def _f(key: str) -> float:
+        try:
+            if key not in bar.index:
+                return float("nan")
+            return float(bar[key])
+        except Exception:
+            return float("nan")
+
+    o, h, lo, c = _f("open"), _f("high"), _f("low"), _f("close")
+    vol = bar["volume"] if "volume" in bar.index else np.nan
+    vol_s = f"{float(vol):.0f}" if pd.notna(vol) else "n/a"
+    logger.info(
+        "BAR_CLOSE | mode=%s | contract=%s | bar_end=%s | O=%.4f H=%.4f L=%.4f C=%.4f | volume=%s",
+        mode,
+        contract_label,
+        ts_text,
+        o,
+        h,
+        lo,
+        c,
+        vol_s,
+    )
 
 
 def print_banner():
@@ -157,18 +294,17 @@ def create_telegram_notifier(config: dict) -> 'TelegramNotifier':
 def get_menu_choice() -> str:
     """Display main menu and get user choice."""
     print("What would you like to do?\n")
-    print("  [1] Backtest (IBKR) - Test strategy on IBKR historical data")
-    print("  [2] Backtest (Databento) - Test strategy on Databento CSV data")
-    print("  [3] Paper Trade - Trade on IBKR paper account (with Dashboard)")
-    print("  [4] Live Trade - Trade with REAL money (with Dashboard)")
+    print("  [1] Backtest - Choose market (Nasdaq/Gold) and source (Databento/IBKR)")
+    print("  [2] Paper Trade - Trade on IBKR paper account (with Dashboard)")
+    print("  [3] Live Trade - Trade with REAL money (with Dashboard)")
     print("  [0] Exit")
     print()
     
     while True:
-        choice = input("Enter your choice (0-4): ").strip()
-        if choice in ['0', '1', '2', '3', '4']:
+        choice = input("Enter your choice (0-3): ").strip()
+        if choice in ['0', '1', '2', '3']:
             return choice
-        print("Invalid choice. Please enter 0, 1, 2, 3, or 4.")
+        print("Invalid choice. Please enter 0, 1, 2, or 3.")
 
 
 def get_contracts() -> int:
@@ -445,6 +581,13 @@ async def run_paper_trading_v2(config: dict) -> None:
     from data.strategy_indicators import live_bar_indicator_slice, bar_flips_for_state_manager
 
     sides = resolve_side_configs(strategy_cfg)
+
+    if strategy_cfg.get("execution", {}).get("independent_books"):
+        print(
+            "[!] strategy.yaml has execution.independent_books=true (backtest merges separate "
+            "long/short runs). Paper uses one combined book — trade list will not match merged "
+            "backtest 1:1.\n"
+        )
     
     conn_cfg = ibkr_cfg.get('connection', {})
     recon_cfg = ibkr_cfg.get('reconnection', {})
@@ -463,7 +606,7 @@ async def run_paper_trading_v2(config: dict) -> None:
     connection_config = ConnectionConfig(
         host=conn_cfg.get('host', '127.0.0.1'),
         port=port,
-        client_id=conn_cfg.get('client_id', 1),
+        client_id=resolve_ib_client_id(conn_cfg),
         max_reconnect_attempts=recon_cfg.get('max_attempts', 0),  # 0 = infinite
         initial_delay=recon_cfg.get('initial_delay_sec', 5),
         max_delay=recon_cfg.get('max_delay_sec', 60),
@@ -511,6 +654,7 @@ async def run_paper_trading_v2(config: dict) -> None:
         # Step 3: Restart data feed
         if shared_state['feed']:
             await shared_state['feed'].start(initial_lookback_days=5)
+            seed_dashboard_prices_from_feed(dashboard, shared_state['feed'])
 
         dashboard.print_event("INFO", "Resync complete - Trading active")
         await telegram.notify_reconnected()
@@ -538,6 +682,10 @@ async def run_paper_trading_v2(config: dict) -> None:
     )
 
     try:
+        print(
+            f"\n[i] IB API client_id={connection_config.client_id} "
+            f"(unique per session; override with IB_CLIENT_ID env or config/ibkr.yaml)"
+        )
         print(f"\nConnecting to IBKR Paper via {gateway_type} on port {port}...")
         if not await conn_manager.connect():
             print("[X] Failed to connect to IBKR")
@@ -566,6 +714,7 @@ async def run_paper_trading_v2(config: dict) -> None:
         contract = sorted_contracts[0].contract
         shared_state['contract'] = contract
         print(f"[OK] Trading: {contract.localSymbol}")
+        contract_label = contract_label_from_ib(contract)
         
         # Initialize components
         signal_engine = SignalEngine(
@@ -639,6 +788,15 @@ async def run_paper_trading_v2(config: dict) -> None:
                         buying_power=account_summary.get('buying_power', 0),
                         daily_pnl=account_summary.get('daily_pnl', 0)
                     )
+                    ib_connected = ib.isConnected()
+                    dashboard.update_connection_status(ib_connected)
+                    log_price_poll_snapshot(
+                        "PAPER",
+                        contract_label,
+                        dashboard,
+                        feed=primary_feed,
+                        ib_connected=ib_connected,
+                    )
                     
                     # Print dashboard
                     dashboard.print_dashboard(clear=True)
@@ -655,279 +813,278 @@ async def run_paper_trading_v2(config: dict) -> None:
         def on_bar_update(bar):
             """Update current price for dashboard and Telegram P&L."""
             telegram.update_current_price(bar.close)
-            dashboard.update_price(bar.close)
+            dashboard.update_price(bar.close, bar.date)
         
         async def on_bar_close(df, bar):
-            if df is None or len(df) < 60:
-                return
-            
-            inds = live_bar_indicator_slice(
-                df,
-                sides["long_supertrend_entry"],
-                sides["short_supertrend_entry"],
-                sides["long_adx"],
-                sides["short_adx"],
-                long_supertrend_exit=sides["long_supertrend_exit"],
-                short_supertrend_exit=sides["short_supertrend_exit"],
-                row_i=-2,
-            )
-            ema_1h, close_1h = mtf.get_confirmed_1h_ema(df)
-            
-            current_bar = df.iloc[-2].copy()
-            for k, v in inds.items():
-                current_bar[k] = v
-            
-            if 'volume' in df.columns and len(df) >= max(1, int(strategy_cfg.get('volume_ma_period', 20))):
-                current_bar['volume_ma'] = float(
-                    df['volume'].rolling(
-                        max(1, int(strategy_cfg.get('volume_ma_period', 20))),
-                        min_periods=max(1, int(strategy_cfg.get('volume_ma_period', 20)))
-                    ).mean().iloc[-2]
+            try:
+                if df is None or len(df) < 60:
+                    return
+
+                from data.live_bar_alignment import enrich_10m_with_1h_like_backtest
+
+                inds = live_bar_indicator_slice(
+                    df,
+                    sides["long_supertrend_entry"],
+                    sides["short_supertrend_entry"],
+                    sides["long_adx"],
+                    sides["short_adx"],
+                    long_supertrend_exit=sides["long_supertrend_exit"],
+                    short_supertrend_exit=sides["short_supertrend_exit"],
+                    row_i=-2,
                 )
-            else:
-                current_bar['volume_ma'] = np.nan
-            
-            current_bar['ema_1h'] = ema_1h
-            current_bar['close_1h'] = close_1h
-            current_bar['ema_bull'] = close_1h > ema_1h if not pd.isna(ema_1h) else False
-            current_bar['ema_bear'] = close_1h < ema_1h if not pd.isna(ema_1h) else False
-            
-            # Get 1H high/low for ST flip alignment check
-            df_1h = mtf.aggregate_1h_from_10m(df)
-            current_hour = df.iloc[-2].name.floor('1h')
-            if current_hour in df_1h.index:
-                current_bar['high_1h'] = df_1h.loc[current_hour, 'high']
-                current_bar['low_1h'] = df_1h.loc[current_hour, 'low']
-            else:
-                current_bar['high_1h'] = np.nan
-                current_bar['low_1h'] = np.nan
-            
-            # Detect new 1H candle boundary (for partial cross detection)
-            last_closed_10m_time = df.iloc[-2].name
-            current_bar['is_new_1h_candle'] = (last_closed_10m_time.minute == 0)
-            
-            # Detect EMA cross (for deferred entries after unaligned ST flips)
-            # Also set close_1h_cross / ema_1h_cross (previous completed hour's values)
-            # used by signal engine to decide st_flip vs ema_cross on ST flip bars.
-            if len(df_1h) >= 3:
-                from indicators.ema import calculate_ema
-                ema_series = calculate_ema(df_1h['close'], ema_cfg.get('length', 200))
-                
-                # Previous completed hour's close & EMA (for ST flip alignment check)
-                # df_1h[-1] = current (partial) hour, df_1h[-2] = last completed hour
-                current_bar['close_1h_cross'] = df_1h['close'].iloc[-2]
-                current_bar['ema_1h_cross'] = ema_series.iloc[-2]
-                
-                prev_close_1h = df_1h['close'].iloc[-3]
-                prev_ema_1h = ema_series.iloc[-3]
-                
-                was_below_ema = prev_close_1h <= prev_ema_1h if not pd.isna(prev_ema_1h) else False
-                was_above_ema = prev_close_1h >= prev_ema_1h if not pd.isna(prev_ema_1h) else False
-                
-                current_bar['ema_bull_cross'] = current_bar['ema_bull'] and was_below_ema
-                current_bar['ema_bear_cross'] = current_bar['ema_bear'] and was_above_ema
-            else:
-                current_bar['ema_bull_cross'] = False
-                current_bar['ema_bear_cross'] = False
-            
-            # Update dashboard indicators
-            st_dir = "BULL" if current_bar.get('direction_long', current_bar.get('direction', 0)) == -1 else "BEAR"
-            ema_status = "BULL" if current_bar['ema_bull'] else ("BEAR" if current_bar['ema_bear'] else "NEUTRAL")
-            adx_val = current_bar.get('adx', 0)
-            
-            dashboard.update_price(current_bar['close'], current_bar.name)
-            dashboard.update_indicators(st_dir, ema_status, adx_val)
-            
-            # Log events (these show in dashboard events area)
-            events = ""
-            if current_bar.get('st_bull_flip', False):
-                events = "SuperTrend flipped BULLISH"
-                dashboard.print_event("SIGNAL", events)
-            elif current_bar.get('st_bear_flip', False):
-                events = "SuperTrend flipped BEARISH"
-                dashboard.print_event("SIGNAL", events)
-            if current_bar.get('ema_bull_cross', False):
-                events = "EMA Cross BULLISH"
-                dashboard.print_event("SIGNAL", events)
-            elif current_bar.get('ema_bear_cross', False):
-                events = "EMA Cross BEARISH"
-                dashboard.print_event("SIGNAL", events)
-            
-            bf, br, st_direction = bar_flips_for_state_manager(current_bar)
-            state_manager.update_supertrend_state(
-                st_bull_flip=bf,
-                st_bear_flip=br,
-                current_direction=st_direction
-            )
-            
-            state = state_manager.state
-            
-            # Check exits
-            if state.position_size != 0:
-                exit_signal = signal_engine.check_exit_conditions(
-                    bar=current_bar,
-                    position_size=state.position_size,
-                    entry_price=state.entry_price,
-                    stop_loss=state.stop_loss,
-                    take_profit=state.take_profit
+                # Same 1H mapping + cross logic as HistoricalDataLoader.prepare_strategy_data / backtest
+                df_1h = mtf.aggregate_1h_from_10m(df)
+                df_aligned = enrich_10m_with_1h_like_backtest(
+                    df, df_1h, ema_cfg.get("length", 200)
                 )
-                
-                if exit_signal:
-                    action = "SELL" if state.position_size > 0 else "BUY"
-                    direction = "LONG" if state.position_size > 0 else "SHORT"
-                    
-                    dashboard.print_event("EXIT", f"{exit_signal.exit_type.value.upper()} triggered - Closing position")
-                    
-                    # Close with MARKET order (bot manages SL/TP, not IBKR)
-                    await order_manager.place_market_order(
-                        action=action,
-                        quantity=abs(state.position_size) * contracts
+                current_bar = df_aligned.iloc[-2].copy()
+                for k, v in inds.items():
+                    current_bar[k] = v
+
+                if 'volume' in df.columns and len(df) >= max(1, int(strategy_cfg.get('volume_ma_period', 20))):
+                    current_bar['volume_ma'] = float(
+                        df['volume'].rolling(
+                            max(1, int(strategy_cfg.get('volume_ma_period', 20))),
+                            min_periods=max(1, int(strategy_cfg.get('volume_ma_period', 20)))
+                        ).mean().iloc[-2]
                     )
-                    
-                    # Calculate P&L
-                    if state.position_size > 0:
-                        pnl_points = exit_signal.exit_price - state.entry_price
-                    else:
-                        pnl_points = state.entry_price - exit_signal.exit_price
-                    pnl_dollars = pnl_points * 2 * contracts
-                    
-                    # Update dashboard
-                    dashboard.on_exit(
-                        exit_price=exit_signal.exit_price,
-                        exit_type=exit_signal.exit_type.value,
-                        pnl_dollars=pnl_dollars
-                    )
-                    
-                    # Telegram notification for trade closure
-                    await telegram.notify_trade_closed(
-                        direction=direction,
+                else:
+                    current_bar['volume_ma'] = np.nan
+
+                # Update dashboard indicators
+                st_dir = "BULL" if current_bar.get('direction_long', current_bar.get('direction', 0)) == -1 else "BEAR"
+                ema_status = "BULL" if current_bar['ema_bull'] else ("BEAR" if current_bar['ema_bear'] else "NEUTRAL")
+                adx_val = current_bar.get('adx', 0)
+
+                dashboard.update_price(current_bar['close'], current_bar.name)
+                dashboard.update_indicators(st_dir, ema_status, adx_val)
+                log_bar_close_snapshot("PAPER", contract_label, current_bar)
+
+                # Log events (these show in dashboard events area)
+                events = ""
+                if current_bar.get('st_bull_flip', False):
+                    events = "SuperTrend flipped BULLISH"
+                    dashboard.print_event("SIGNAL", events)
+                elif current_bar.get('st_bear_flip', False):
+                    events = "SuperTrend flipped BEARISH"
+                    dashboard.print_event("SIGNAL", events)
+                if current_bar.get('ema_bull_cross', False):
+                    events = "EMA Cross BULLISH"
+                    dashboard.print_event("SIGNAL", events)
+                elif current_bar.get('ema_bear_cross', False):
+                    events = "EMA Cross BEARISH"
+                    dashboard.print_event("SIGNAL", events)
+
+                bf, br, st_direction = bar_flips_for_state_manager(current_bar)
+                state_manager.update_supertrend_state(
+                    st_bull_flip=bf,
+                    st_bear_flip=br,
+                    current_direction=st_direction
+                )
+
+                state = state_manager.state
+
+                # Check exits (match backtest: respect entry_time on same bar)
+                if state.position_size != 0:
+                    exit_signal = signal_engine.check_exit_conditions(
+                        bar=current_bar,
+                        position_size=state.position_size,
                         entry_price=state.entry_price,
-                        exit_price=exit_signal.exit_price,
-                        exit_reason=exit_signal.exit_type.value,
-                        pnl_points=pnl_points,
-                        pnl_dollars=pnl_dollars,
-                        contracts=contracts,
-                        trade_id=state.trade_count,
-                        entry_time=state.entry_time
+                        stop_loss=state.stop_loss,
+                        take_profit=state.take_profit,
+                        entry_time=state.entry_time,
                     )
-                    
-                    state_manager.on_exit(exit_signal)
-            
-            # Check entries
-            if state.position_size == 0:
-                vol_win = (
-                    SignalEngine.single_row_volume_window(current_bar)
-                    if signal_engine.volume_check
-                    else None
-                )
-                entry_signal, entry_updates = signal_engine.evaluate_entry_conditions(
-                    bar=current_bar,
-                    position_size=0,
-                    traded_in_bull_trend=state.traded_in_bull_trend,
-                    traded_in_bear_trend=state.traded_in_bear_trend,
-                    pending_long_ema_wait=state.pending_long_ema_wait,
-                    pending_short_ema_wait=state.pending_short_ema_wait,
-                    pending_adx_long=state.pending_adx_long,
-                    pending_adx_short=state.pending_adx_short,
-                    adx_wait_bars_left_long=state.adx_wait_bars_left_long,
-                    adx_wait_bars_left_short=state.adx_wait_bars_left_short,
-                    adx_wait_trigger_long=state.adx_wait_trigger_long,
-                    adx_wait_trigger_short=state.adx_wait_trigger_short,
-                    volume_window=vol_win,
-                    allow_volume_defer=True,
-                    pending_volume_long=state.pending_volume_long,
-                    pending_volume_short=state.pending_volume_short,
-                    volume_wait_bars_left_long=state.volume_wait_bars_left_long,
-                    volume_wait_bars_left_short=state.volume_wait_bars_left_short,
-                    volume_wait_trigger_long=state.volume_wait_trigger_long,
-                    volume_wait_trigger_short=state.volume_wait_trigger_short,
-                    volume_wait_kind_long=state.volume_wait_kind_long,
-                    volume_wait_kind_short=state.volume_wait_kind_short,
-                )
-                if entry_updates.get("set_pending_long_ema_wait"):
-                    state_manager.set_pending_long_ema_wait()
-                if entry_updates.get("clear_pending_long_ema_wait"):
-                    state_manager.clear_pending_long_ema_wait()
-                if entry_updates.get("set_pending_short_ema_wait"):
-                    state_manager.set_pending_short_ema_wait()
-                if entry_updates.get("clear_pending_short_ema_wait"):
-                    state_manager.clear_pending_short_ema_wait()
-                # ADX wait updates
-                if entry_updates.get("set_adx_wait_long"):
-                    data = entry_updates["set_adx_wait_long"]
-                    state_manager.set_adx_wait_long(data["bars"], data["trigger"])
-                if entry_updates.get("clear_adx_wait_long"):
-                    state_manager.clear_adx_wait_long()
-                if entry_updates.get("decrement_adx_wait_long"):
-                    state_manager.decrement_adx_wait_long()
-                if entry_updates.get("set_adx_wait_short"):
-                    data = entry_updates["set_adx_wait_short"]
-                    state_manager.set_adx_wait_short(data["bars"], data["trigger"])
-                if entry_updates.get("clear_adx_wait_short"):
-                    state_manager.clear_adx_wait_short()
-                if entry_updates.get("decrement_adx_wait_short"):
-                    state_manager.decrement_adx_wait_short()
-                if entry_updates.get("set_volume_wait_long"):
-                    d = entry_updates["set_volume_wait_long"]
-                    state_manager.set_volume_wait_long(d["remaining"], d["trigger"], d["kind"])
-                if entry_updates.get("set_volume_wait_short"):
-                    d = entry_updates["set_volume_wait_short"]
-                    state_manager.set_volume_wait_short(d["remaining"], d["trigger"], d["kind"])
-                if entry_updates.get("clear_pending_volume_long"):
-                    state_manager.clear_volume_wait_long()
-                if entry_updates.get("clear_pending_volume_short"):
-                    state_manager.clear_volume_wait_short()
-                if entry_updates.get("decrement_volume_wait_long"):
-                    state_manager.decrement_volume_wait_long()
-                if entry_updates.get("decrement_volume_wait_short"):
-                    state_manager.decrement_volume_wait_short()
-                if entry_signal:
-                    is_long = entry_signal.signal_type == SignalType.BUY
-                    direction = "LONG" if is_long else "SHORT"
-                    
-                    dashboard.print_event("ENTRY", f"{direction} @ {entry_signal.price:.2f}")
-                    
-                    stop_loss, take_profit = signal_engine.calculate_exit_levels(
-                        entry_price=entry_signal.price,
-                        is_long=is_long
+
+                    if exit_signal:
+                        action = "SELL" if state.position_size > 0 else "BUY"
+                        direction = "LONG" if state.position_size > 0 else "SHORT"
+
+                        dashboard.print_event("EXIT", f"{exit_signal.exit_type.value.upper()} triggered - Closing position")
+
+                        # Close with MARKET order (bot manages SL/TP, not IBKR)
+                        await order_manager.place_market_order(
+                            action=action,
+                            quantity=abs(state.position_size) * contracts
+                        )
+
+                        # Calculate P&L
+                        if state.position_size > 0:
+                            pnl_points = exit_signal.exit_price - state.entry_price
+                        else:
+                            pnl_points = state.entry_price - exit_signal.exit_price
+                        pnl_dollars = pnl_points * 2 * contracts
+
+                        logger.info(
+                            "ORDER_EXIT | mode=PAPER | contract=%s | direction=%s | exit_type=%s | "
+                            "exit_price=%.4f | entry_price=%.4f | pnl_pts=%.2f | pnl_usd=%.2f | contracts=%s",
+                            contract_label,
+                            direction,
+                            exit_signal.exit_type.value,
+                            exit_signal.exit_price,
+                            state.entry_price,
+                            pnl_points,
+                            pnl_dollars,
+                            contracts,
+                        )
+
+                        # Update dashboard
+                        dashboard.on_exit(
+                            exit_price=exit_signal.exit_price,
+                            exit_type=exit_signal.exit_type.value,
+                            pnl_dollars=pnl_dollars
+                        )
+
+                        # Telegram notification for trade closure
+                        await telegram.notify_trade_closed(
+                            direction=direction,
+                            entry_price=state.entry_price,
+                            exit_price=exit_signal.exit_price,
+                            exit_reason=exit_signal.exit_type.value,
+                            pnl_points=pnl_points,
+                            pnl_dollars=pnl_dollars,
+                            contracts=contracts,
+                            trade_id=state.trade_count,
+                            entry_time=state.entry_time
+                        )
+
+                        state_manager.on_exit(exit_signal)
+
+                # Check entries (allow_volume_defer=False matches BacktestEngine)
+                if state.position_size == 0:
+                    vol_win = (
+                        SignalEngine.single_row_volume_window(current_bar)
+                        if signal_engine.volume_check
+                        else None
                     )
-                    
-                    # Place MARKET entry order only (no bracket)
-                    # Bot will monitor SL/TP and exit with market order when hit
-                    await order_manager.place_market_order(
-                        action="BUY" if is_long else "SELL",
-                        quantity=contracts
+                    entry_signal, entry_updates = signal_engine.evaluate_entry_conditions(
+                        bar=current_bar,
+                        position_size=0,
+                        traded_in_bull_trend=state.traded_in_bull_trend,
+                        traded_in_bear_trend=state.traded_in_bear_trend,
+                        pending_long_ema_wait=state.pending_long_ema_wait,
+                        pending_short_ema_wait=state.pending_short_ema_wait,
+                        pending_adx_long=state.pending_adx_long,
+                        pending_adx_short=state.pending_adx_short,
+                        adx_wait_bars_left_long=state.adx_wait_bars_left_long,
+                        adx_wait_bars_left_short=state.adx_wait_bars_left_short,
+                        adx_wait_trigger_long=state.adx_wait_trigger_long,
+                        adx_wait_trigger_short=state.adx_wait_trigger_short,
+                        volume_window=vol_win,
+                        allow_volume_defer=False,
+                        pending_volume_long=state.pending_volume_long,
+                        pending_volume_short=state.pending_volume_short,
+                        volume_wait_bars_left_long=state.volume_wait_bars_left_long,
+                        volume_wait_bars_left_short=state.volume_wait_bars_left_short,
+                        volume_wait_trigger_long=state.volume_wait_trigger_long,
+                        volume_wait_trigger_short=state.volume_wait_trigger_short,
+                        volume_wait_kind_long=state.volume_wait_kind_long,
+                        volume_wait_kind_short=state.volume_wait_kind_short,
                     )
-                    
-                    trade_id = state_manager.state.trade_count + 1
-                    
-                    # Update dashboard
-                    dashboard.on_entry(
-                        trade_id=trade_id,
-                        direction=direction,
-                        entry_price=entry_signal.price,
-                        quantity=contracts,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit
-                    )
-                    
-                    state_manager.on_entry(entry_signal, stop_loss, take_profit)
-                    
-                    # Telegram notification for trade placement
-                    await telegram.notify_trade_placed(
-                        direction=direction,
-                        entry_price=entry_signal.price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        contracts=contracts,
-                        trigger=entry_signal.trigger,
-                        trade_id=trade_id
-                    )
-        
+                    if entry_updates.get("set_pending_long_ema_wait"):
+                        state_manager.set_pending_long_ema_wait()
+                    if entry_updates.get("clear_pending_long_ema_wait"):
+                        state_manager.clear_pending_long_ema_wait()
+                    if entry_updates.get("set_pending_short_ema_wait"):
+                        state_manager.set_pending_short_ema_wait()
+                    if entry_updates.get("clear_pending_short_ema_wait"):
+                        state_manager.clear_pending_short_ema_wait()
+                    # ADX wait updates
+                    if entry_updates.get("set_adx_wait_long"):
+                        data = entry_updates["set_adx_wait_long"]
+                        state_manager.set_adx_wait_long(data["bars"], data["trigger"])
+                    if entry_updates.get("clear_adx_wait_long"):
+                        state_manager.clear_adx_wait_long()
+                    if entry_updates.get("decrement_adx_wait_long"):
+                        state_manager.decrement_adx_wait_long()
+                    if entry_updates.get("set_adx_wait_short"):
+                        data = entry_updates["set_adx_wait_short"]
+                        state_manager.set_adx_wait_short(data["bars"], data["trigger"])
+                    if entry_updates.get("clear_adx_wait_short"):
+                        state_manager.clear_adx_wait_short()
+                    if entry_updates.get("decrement_adx_wait_short"):
+                        state_manager.decrement_adx_wait_short()
+                    if entry_updates.get("set_volume_wait_long"):
+                        d = entry_updates["set_volume_wait_long"]
+                        state_manager.set_volume_wait_long(d["remaining"], d["trigger"], d["kind"])
+                    if entry_updates.get("set_volume_wait_short"):
+                        d = entry_updates["set_volume_wait_short"]
+                        state_manager.set_volume_wait_short(d["remaining"], d["trigger"], d["kind"])
+                    if entry_updates.get("clear_pending_volume_long"):
+                        state_manager.clear_volume_wait_long()
+                    if entry_updates.get("clear_pending_volume_short"):
+                        state_manager.clear_volume_wait_short()
+                    if entry_updates.get("decrement_volume_wait_long"):
+                        state_manager.decrement_volume_wait_long()
+                    if entry_updates.get("decrement_volume_wait_short"):
+                        state_manager.decrement_volume_wait_short()
+                    if entry_signal:
+                        is_long = entry_signal.signal_type == SignalType.BUY
+                        direction = "LONG" if is_long else "SHORT"
+
+                        dashboard.print_event("ENTRY", f"{direction} @ {entry_signal.price:.2f}")
+
+                        stop_loss, take_profit = signal_engine.calculate_exit_levels(
+                            entry_price=entry_signal.price,
+                            is_long=is_long
+                        )
+
+                        # Place MARKET entry order only (no bracket)
+                        # Bot will monitor SL/TP and exit with market order when hit
+                        await order_manager.place_market_order(
+                            action="BUY" if is_long else "SELL",
+                            quantity=contracts
+                        )
+
+                        trade_id = state_manager.state.trade_count + 1
+
+                        # Update dashboard
+                        dashboard.on_entry(
+                            trade_id=trade_id,
+                            direction=direction,
+                            entry_price=entry_signal.price,
+                            quantity=contracts,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit
+                        )
+
+                        state_manager.on_entry(entry_signal, stop_loss, take_profit)
+
+                        logger.info(
+                            "ORDER_ENTRY | mode=PAPER | contract=%s | direction=%s | entry_price=%.4f | "
+                            "qty=%s | SL=%.4f | TP=%.4f | trigger=%s | trade_id=%s",
+                            contract_label,
+                            direction,
+                            entry_signal.price,
+                            contracts,
+                            stop_loss,
+                            take_profit,
+                            entry_signal.trigger,
+                            trade_id,
+                        )
+
+                        # Telegram notification for trade placement
+                        await telegram.notify_trade_placed(
+                            direction=direction,
+                            entry_price=entry_signal.price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            contracts=contracts,
+                            trigger=entry_signal.trigger,
+                            trade_id=trade_id
+                        )
+            except Exception as e:
+                logger.exception("Paper on_bar_close failed: %s", e)
+
         primary_feed.on_bar_close(lambda df, bar: asyncio.create_task(on_bar_close(df, bar)))
         primary_feed.on_bar_update(on_bar_update)
         
         await primary_feed.start(initial_lookback_days=15)
+        seed_dashboard_prices_from_feed(dashboard, primary_feed)
+        _df0 = primary_feed.get_dataframe()
+        logger.info(
+            "Realtime feed ready: %s buffered bars; dashboard seeded from last OHLC row",
+            len(_df0) if _df0 is not None else 0,
+        )
         
         # Start dashboard update task
         dashboard_task = asyncio.create_task(update_dashboard_loop())
@@ -1032,6 +1189,13 @@ async def run_live_trading_v2(config: dict) -> None:
     from data.strategy_indicators import live_bar_indicator_slice, bar_flips_for_state_manager
 
     sides = resolve_side_configs(strategy_cfg)
+
+    if strategy_cfg.get("execution", {}).get("independent_books"):
+        print(
+            "[!] strategy.yaml has execution.independent_books=true (backtest merges separate "
+            "long/short runs). Live uses one combined book — trade list will not match merged "
+            "backtest 1:1.\n"
+        )
     
     conn_cfg = ibkr_cfg.get('connection', {})
     recon_cfg = ibkr_cfg.get('reconnection', {})
@@ -1050,7 +1214,7 @@ async def run_live_trading_v2(config: dict) -> None:
     connection_config = ConnectionConfig(
         host=conn_cfg.get('host', '127.0.0.1'),
         port=port,
-        client_id=conn_cfg.get('client_id', 1),
+        client_id=resolve_ib_client_id(conn_cfg),
         max_reconnect_attempts=recon_cfg.get('max_attempts', 0),
         initial_delay=recon_cfg.get('initial_delay_sec', 5),
         max_delay=recon_cfg.get('max_delay_sec', 60),
@@ -1098,6 +1262,7 @@ async def run_live_trading_v2(config: dict) -> None:
         # Step 3: Restart data feed
         if shared_state['feed']:
             await shared_state['feed'].start(initial_lookback_days=5)
+            seed_dashboard_prices_from_feed(dashboard, shared_state['feed'])
 
         dashboard.print_event("INFO", "Resync complete - Trading active")
         await telegram.notify_reconnected()
@@ -1124,6 +1289,10 @@ async def run_live_trading_v2(config: dict) -> None:
     )
 
     try:
+        print(
+            f"\n[i] IB API client_id={connection_config.client_id} "
+            f"(unique per session; override with IB_CLIENT_ID env or config/ibkr.yaml)"
+        )
         print(f"\nConnecting to IBKR LIVE via {gateway_type} on port {port}...")
         if not await conn_manager.connect():
             print("[X] Failed to connect to IBKR")
@@ -1132,7 +1301,7 @@ async def run_live_trading_v2(config: dict) -> None:
         
         dashboard.update_connection_status(True)
         print(f"[OK] Connected to IBKR LIVE Account via {gateway_type}")
-        print("[!] ⚠️  REAL MONEY MODE - Orders will execute on live account!")
+        print("[!] REAL MONEY MODE - Orders will execute on live account!")
         await telegram.notify_connected(f"{gateway_type} (LIVE)")
         
         ib = conn_manager.client
@@ -1153,6 +1322,7 @@ async def run_live_trading_v2(config: dict) -> None:
         contract = sorted_contracts[0].contract
         shared_state['contract'] = contract
         print(f"[OK] Trading: {contract.localSymbol}")
+        contract_label = contract_label_from_ib(contract)
         
         # Initialize components (same as paper trading)
         signal_engine = SignalEngine(
@@ -1224,6 +1394,15 @@ async def run_live_trading_v2(config: dict) -> None:
                         buying_power=account_summary.get('buying_power', 0),
                         daily_pnl=account_summary.get('daily_pnl', 0)
                     )
+                    ib_connected = ib.isConnected()
+                    dashboard.update_connection_status(ib_connected)
+                    log_price_poll_snapshot(
+                        "LIVE",
+                        contract_label,
+                        dashboard,
+                        feed=primary_feed,
+                        ib_connected=ib_connected,
+                    )
                     dashboard.print_dashboard(clear=True)
                     await asyncio.sleep(5)
                 except asyncio.CancelledError:
@@ -1236,270 +1415,260 @@ async def run_live_trading_v2(config: dict) -> None:
         def on_bar_update(bar):
             """Update current price for dashboard and Telegram P&L."""
             telegram.update_current_price(bar.close)
-            dashboard.update_price(bar.close)
+            dashboard.update_price(bar.close, bar.date)
         
-        # Bar close handler (identical logic to paper trading)
+        # Bar close handler (same bar/predicate alignment as paper + backtest)
         async def on_bar_close(df, bar):
-            if df is None or len(df) < 60:
-                return
-            
-            inds = live_bar_indicator_slice(
-                df,
-                sides["long_supertrend_entry"],
-                sides["short_supertrend_entry"],
-                sides["long_adx"],
-                sides["short_adx"],
-                long_supertrend_exit=sides["long_supertrend_exit"],
-                short_supertrend_exit=sides["short_supertrend_exit"],
-                row_i=-2,
-            )
-            ema_1h, close_1h = mtf.get_confirmed_1h_ema(df)
-            
-            current_bar = df.iloc[-2].copy()
-            for k, v in inds.items():
-                current_bar[k] = v
-            
-            if 'volume' in df.columns and len(df) >= max(1, int(strategy_cfg.get('volume_ma_period', 20))):
-                current_bar['volume_ma'] = float(
-                    df['volume'].rolling(
-                        max(1, int(strategy_cfg.get('volume_ma_period', 20))),
-                        min_periods=max(1, int(strategy_cfg.get('volume_ma_period', 20)))
-                    ).mean().iloc[-2]
+            try:
+                if df is None or len(df) < 60:
+                    return
+
+                from data.live_bar_alignment import enrich_10m_with_1h_like_backtest
+
+                inds = live_bar_indicator_slice(
+                    df,
+                    sides["long_supertrend_entry"],
+                    sides["short_supertrend_entry"],
+                    sides["long_adx"],
+                    sides["short_adx"],
+                    long_supertrend_exit=sides["long_supertrend_exit"],
+                    short_supertrend_exit=sides["short_supertrend_exit"],
+                    row_i=-2,
                 )
-            else:
-                current_bar['volume_ma'] = np.nan
-            
-            current_bar['ema_1h'] = ema_1h
-            current_bar['close_1h'] = close_1h
-            current_bar['ema_bull'] = close_1h > ema_1h if not pd.isna(ema_1h) else False
-            current_bar['ema_bear'] = close_1h < ema_1h if not pd.isna(ema_1h) else False
-            
-            # Get 1H high/low for ST flip alignment check
-            df_1h = mtf.aggregate_1h_from_10m(df)
-            current_hour = df.iloc[-2].name.floor('1h')
-            if current_hour in df_1h.index:
-                current_bar['high_1h'] = df_1h.loc[current_hour, 'high']
-                current_bar['low_1h'] = df_1h.loc[current_hour, 'low']
-            else:
-                current_bar['high_1h'] = np.nan
-                current_bar['low_1h'] = np.nan
-            
-            # Detect new 1H candle boundary (for partial cross detection)
-            last_closed_10m_time = df.iloc[-2].name
-            current_bar['is_new_1h_candle'] = (last_closed_10m_time.minute == 0)
-            
-            # Detect EMA cross (for deferred entries after unaligned ST flips)
-            # Also set close_1h_cross / ema_1h_cross (previous completed hour's values)
-            # used by signal engine to decide st_flip vs ema_cross on ST flip bars.
-            if len(df_1h) >= 3:
-                from indicators.ema import calculate_ema
-                ema_series = calculate_ema(df_1h['close'], ema_cfg.get('length', 200))
-                
-                # Previous completed hour's close & EMA (for ST flip alignment check)
-                # df_1h[-1] = current (partial) hour, df_1h[-2] = last completed hour
-                current_bar['close_1h_cross'] = df_1h['close'].iloc[-2]
-                current_bar['ema_1h_cross'] = ema_series.iloc[-2]
-                
-                prev_close_1h = df_1h['close'].iloc[-3]
-                prev_ema_1h = ema_series.iloc[-3]
-                
-                was_below_ema = prev_close_1h <= prev_ema_1h if not pd.isna(prev_ema_1h) else False
-                was_above_ema = prev_close_1h >= prev_ema_1h if not pd.isna(prev_ema_1h) else False
-                
-                current_bar['ema_bull_cross'] = current_bar['ema_bull'] and was_below_ema
-                current_bar['ema_bear_cross'] = current_bar['ema_bear'] and was_above_ema
-            else:
-                current_bar['ema_bull_cross'] = False
-                current_bar['ema_bear_cross'] = False
-            
-            st_dir = "BULL" if current_bar.get('direction_long', current_bar.get('direction', 0)) == -1 else "BEAR"
-            ema_status = "BULL" if current_bar['ema_bull'] else ("BEAR" if current_bar['ema_bear'] else "NEUTRAL")
-            adx_val = current_bar.get('adx', 0)
-            
-            dashboard.update_price(current_bar['close'], current_bar.name)
-            dashboard.update_indicators(st_dir, ema_status, adx_val)
-            
-            if current_bar.get('st_bull_flip', False):
-                dashboard.print_event("SIGNAL", "SuperTrend flipped BULLISH")
-            elif current_bar.get('st_bear_flip', False):
-                dashboard.print_event("SIGNAL", "SuperTrend flipped BEARISH")
-            if current_bar.get('ema_bull_cross', False):
-                dashboard.print_event("SIGNAL", "EMA Cross BULLISH")
-            elif current_bar.get('ema_bear_cross', False):
-                dashboard.print_event("SIGNAL", "EMA Cross BEARISH")
-            
-            bf, br, st_direction = bar_flips_for_state_manager(current_bar)
-            state_manager.update_supertrend_state(
-                st_bull_flip=bf,
-                st_bear_flip=br,
-                current_direction=st_direction
-            )
-            
-            state = state_manager.state
-            
-            # Check exits
-            if state.position_size != 0:
-                exit_signal = signal_engine.check_exit_conditions(
-                    bar=current_bar,
-                    position_size=state.position_size,
-                    entry_price=state.entry_price,
-                    stop_loss=state.stop_loss,
-                    take_profit=state.take_profit
+                df_1h = mtf.aggregate_1h_from_10m(df)
+                df_aligned = enrich_10m_with_1h_like_backtest(
+                    df, df_1h, ema_cfg.get("length", 200)
                 )
-                
-                if exit_signal:
-                    action = "SELL" if state.position_size > 0 else "BUY"
-                    direction = "LONG" if state.position_size > 0 else "SHORT"
-                    
-                    dashboard.print_event("EXIT", f"LIVE {exit_signal.exit_type.value.upper()} - Closing position")
-                    
-                    # Close with MARKET order (bot manages SL/TP, not IBKR)
-                    await order_manager.place_market_order(
-                        action=action,
-                        quantity=abs(state.position_size) * contracts
+                current_bar = df_aligned.iloc[-2].copy()
+                for k, v in inds.items():
+                    current_bar[k] = v
+
+                if 'volume' in df.columns and len(df) >= max(1, int(strategy_cfg.get('volume_ma_period', 20))):
+                    current_bar['volume_ma'] = float(
+                        df['volume'].rolling(
+                            max(1, int(strategy_cfg.get('volume_ma_period', 20))),
+                            min_periods=max(1, int(strategy_cfg.get('volume_ma_period', 20)))
+                        ).mean().iloc[-2]
                     )
-                    
-                    if state.position_size > 0:
-                        pnl_points = exit_signal.exit_price - state.entry_price
-                    else:
-                        pnl_points = state.entry_price - exit_signal.exit_price
-                    pnl_dollars = pnl_points * 2 * contracts
-                    
-                    dashboard.on_exit(
-                        exit_price=exit_signal.exit_price,
-                        exit_type=exit_signal.exit_type.value,
-                        pnl_dollars=pnl_dollars
-                    )
-                    
-                    # Telegram notification for trade closure
-                    await telegram.notify_trade_closed(
-                        direction=direction,
+                else:
+                    current_bar['volume_ma'] = np.nan
+
+                st_dir = "BULL" if current_bar.get('direction_long', current_bar.get('direction', 0)) == -1 else "BEAR"
+                ema_status = "BULL" if current_bar['ema_bull'] else ("BEAR" if current_bar['ema_bear'] else "NEUTRAL")
+                adx_val = current_bar.get('adx', 0)
+
+                dashboard.update_price(current_bar['close'], current_bar.name)
+                dashboard.update_indicators(st_dir, ema_status, adx_val)
+                log_bar_close_snapshot("LIVE", contract_label, current_bar)
+
+                if current_bar.get('st_bull_flip', False):
+                    dashboard.print_event("SIGNAL", "SuperTrend flipped BULLISH")
+                elif current_bar.get('st_bear_flip', False):
+                    dashboard.print_event("SIGNAL", "SuperTrend flipped BEARISH")
+                if current_bar.get('ema_bull_cross', False):
+                    dashboard.print_event("SIGNAL", "EMA Cross BULLISH")
+                elif current_bar.get('ema_bear_cross', False):
+                    dashboard.print_event("SIGNAL", "EMA Cross BEARISH")
+
+                bf, br, st_direction = bar_flips_for_state_manager(current_bar)
+                state_manager.update_supertrend_state(
+                    st_bull_flip=bf,
+                    st_bear_flip=br,
+                    current_direction=st_direction
+                )
+
+                state = state_manager.state
+
+                if state.position_size != 0:
+                    exit_signal = signal_engine.check_exit_conditions(
+                        bar=current_bar,
+                        position_size=state.position_size,
                         entry_price=state.entry_price,
-                        exit_price=exit_signal.exit_price,
-                        exit_reason=exit_signal.exit_type.value,
-                        pnl_points=pnl_points,
-                        pnl_dollars=pnl_dollars,
-                        contracts=contracts,
-                        trade_id=state.trade_count,
-                        entry_time=state.entry_time
+                        stop_loss=state.stop_loss,
+                        take_profit=state.take_profit,
+                        entry_time=state.entry_time,
                     )
-                    
-                    state_manager.on_exit(exit_signal)
-            
-            # Check entries
-            if state.position_size == 0:
-                vol_win = (
-                    SignalEngine.single_row_volume_window(current_bar)
-                    if signal_engine.volume_check
-                    else None
-                )
-                entry_signal, entry_updates = signal_engine.evaluate_entry_conditions(
-                    bar=current_bar,
-                    position_size=0,
-                    traded_in_bull_trend=state.traded_in_bull_trend,
-                    traded_in_bear_trend=state.traded_in_bear_trend,
-                    pending_long_ema_wait=state.pending_long_ema_wait,
-                    pending_short_ema_wait=state.pending_short_ema_wait,
-                    pending_adx_long=state.pending_adx_long,
-                    pending_adx_short=state.pending_adx_short,
-                    adx_wait_bars_left_long=state.adx_wait_bars_left_long,
-                    adx_wait_bars_left_short=state.adx_wait_bars_left_short,
-                    adx_wait_trigger_long=state.adx_wait_trigger_long,
-                    adx_wait_trigger_short=state.adx_wait_trigger_short,
-                    volume_window=vol_win,
-                    allow_volume_defer=True,
-                    pending_volume_long=state.pending_volume_long,
-                    pending_volume_short=state.pending_volume_short,
-                    volume_wait_bars_left_long=state.volume_wait_bars_left_long,
-                    volume_wait_bars_left_short=state.volume_wait_bars_left_short,
-                    volume_wait_trigger_long=state.volume_wait_trigger_long,
-                    volume_wait_trigger_short=state.volume_wait_trigger_short,
-                    volume_wait_kind_long=state.volume_wait_kind_long,
-                    volume_wait_kind_short=state.volume_wait_kind_short,
-                )
-                if entry_updates.get("set_pending_long_ema_wait"):
-                    state_manager.set_pending_long_ema_wait()
-                if entry_updates.get("clear_pending_long_ema_wait"):
-                    state_manager.clear_pending_long_ema_wait()
-                if entry_updates.get("set_pending_short_ema_wait"):
-                    state_manager.set_pending_short_ema_wait()
-                if entry_updates.get("clear_pending_short_ema_wait"):
-                    state_manager.clear_pending_short_ema_wait()
-                # ADX wait updates
-                if entry_updates.get("set_adx_wait_long"):
-                    data = entry_updates["set_adx_wait_long"]
-                    state_manager.set_adx_wait_long(data["bars"], data["trigger"])
-                if entry_updates.get("clear_adx_wait_long"):
-                    state_manager.clear_adx_wait_long()
-                if entry_updates.get("decrement_adx_wait_long"):
-                    state_manager.decrement_adx_wait_long()
-                if entry_updates.get("set_adx_wait_short"):
-                    data = entry_updates["set_adx_wait_short"]
-                    state_manager.set_adx_wait_short(data["bars"], data["trigger"])
-                if entry_updates.get("clear_adx_wait_short"):
-                    state_manager.clear_adx_wait_short()
-                if entry_updates.get("decrement_adx_wait_short"):
-                    state_manager.decrement_adx_wait_short()
-                if entry_updates.get("set_volume_wait_long"):
-                    d = entry_updates["set_volume_wait_long"]
-                    state_manager.set_volume_wait_long(d["remaining"], d["trigger"], d["kind"])
-                if entry_updates.get("set_volume_wait_short"):
-                    d = entry_updates["set_volume_wait_short"]
-                    state_manager.set_volume_wait_short(d["remaining"], d["trigger"], d["kind"])
-                if entry_updates.get("clear_pending_volume_long"):
-                    state_manager.clear_volume_wait_long()
-                if entry_updates.get("clear_pending_volume_short"):
-                    state_manager.clear_volume_wait_short()
-                if entry_updates.get("decrement_volume_wait_long"):
-                    state_manager.decrement_volume_wait_long()
-                if entry_updates.get("decrement_volume_wait_short"):
-                    state_manager.decrement_volume_wait_short()
-                if entry_signal:
-                    is_long = entry_signal.signal_type == SignalType.BUY
-                    direction = "LONG" if is_long else "SHORT"
-                    
-                    dashboard.print_event("ENTRY", f"LIVE {direction} @ {entry_signal.price:.2f}")
-                    
-                    stop_loss, take_profit = signal_engine.calculate_exit_levels(
-                        entry_price=entry_signal.price,
-                        is_long=is_long
+
+                    if exit_signal:
+                        action = "SELL" if state.position_size > 0 else "BUY"
+                        direction = "LONG" if state.position_size > 0 else "SHORT"
+
+                        dashboard.print_event("EXIT", f"LIVE {exit_signal.exit_type.value.upper()} - Closing position")
+
+                        await order_manager.place_market_order(
+                            action=action,
+                            quantity=abs(state.position_size) * contracts
+                        )
+
+                        if state.position_size > 0:
+                            pnl_points = exit_signal.exit_price - state.entry_price
+                        else:
+                            pnl_points = state.entry_price - exit_signal.exit_price
+                        pnl_dollars = pnl_points * 2 * contracts
+
+                        logger.info(
+                            "ORDER_EXIT | mode=LIVE | contract=%s | direction=%s | exit_type=%s | "
+                            "exit_price=%.4f | entry_price=%.4f | pnl_pts=%.2f | pnl_usd=%.2f | contracts=%s",
+                            contract_label,
+                            direction,
+                            exit_signal.exit_type.value,
+                            exit_signal.exit_price,
+                            state.entry_price,
+                            pnl_points,
+                            pnl_dollars,
+                            contracts,
+                        )
+
+                        dashboard.on_exit(
+                            exit_price=exit_signal.exit_price,
+                            exit_type=exit_signal.exit_type.value,
+                            pnl_dollars=pnl_dollars
+                        )
+
+                        await telegram.notify_trade_closed(
+                            direction=direction,
+                            entry_price=state.entry_price,
+                            exit_price=exit_signal.exit_price,
+                            exit_reason=exit_signal.exit_type.value,
+                            pnl_points=pnl_points,
+                            pnl_dollars=pnl_dollars,
+                            contracts=contracts,
+                            trade_id=state.trade_count,
+                            entry_time=state.entry_time
+                        )
+
+                        state_manager.on_exit(exit_signal)
+
+                if state.position_size == 0:
+                    vol_win = (
+                        SignalEngine.single_row_volume_window(current_bar)
+                        if signal_engine.volume_check
+                        else None
                     )
-                    
-                    # Place MARKET entry order only (no bracket)
-                    # Bot will monitor SL/TP and exit with market order when hit
-                    await order_manager.place_market_order(
-                        action="BUY" if is_long else "SELL",
-                        quantity=contracts
+                    entry_signal, entry_updates = signal_engine.evaluate_entry_conditions(
+                        bar=current_bar,
+                        position_size=0,
+                        traded_in_bull_trend=state.traded_in_bull_trend,
+                        traded_in_bear_trend=state.traded_in_bear_trend,
+                        pending_long_ema_wait=state.pending_long_ema_wait,
+                        pending_short_ema_wait=state.pending_short_ema_wait,
+                        pending_adx_long=state.pending_adx_long,
+                        pending_adx_short=state.pending_adx_short,
+                        adx_wait_bars_left_long=state.adx_wait_bars_left_long,
+                        adx_wait_bars_left_short=state.adx_wait_bars_left_short,
+                        adx_wait_trigger_long=state.adx_wait_trigger_long,
+                        adx_wait_trigger_short=state.adx_wait_trigger_short,
+                        volume_window=vol_win,
+                        allow_volume_defer=False,
+                        pending_volume_long=state.pending_volume_long,
+                        pending_volume_short=state.pending_volume_short,
+                        volume_wait_bars_left_long=state.volume_wait_bars_left_long,
+                        volume_wait_bars_left_short=state.volume_wait_bars_left_short,
+                        volume_wait_trigger_long=state.volume_wait_trigger_long,
+                        volume_wait_trigger_short=state.volume_wait_trigger_short,
+                        volume_wait_kind_long=state.volume_wait_kind_long,
+                        volume_wait_kind_short=state.volume_wait_kind_short,
                     )
-                    
-                    trade_id = state_manager.state.trade_count + 1
-                    
-                    dashboard.on_entry(
-                        trade_id=trade_id,
-                        direction=direction,
-                        entry_price=entry_signal.price,
-                        quantity=contracts,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit
-                    )
-                    
-                    state_manager.on_entry(entry_signal, stop_loss, take_profit)
-                    
-                    # Telegram notification for trade placement
-                    await telegram.notify_trade_placed(
-                        direction=direction,
-                        entry_price=entry_signal.price,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        contracts=contracts,
-                        trigger=entry_signal.trigger,
-                        trade_id=trade_id
-                    )
-        
+                    if entry_updates.get("set_pending_long_ema_wait"):
+                        state_manager.set_pending_long_ema_wait()
+                    if entry_updates.get("clear_pending_long_ema_wait"):
+                        state_manager.clear_pending_long_ema_wait()
+                    if entry_updates.get("set_pending_short_ema_wait"):
+                        state_manager.set_pending_short_ema_wait()
+                    if entry_updates.get("clear_pending_short_ema_wait"):
+                        state_manager.clear_pending_short_ema_wait()
+                    if entry_updates.get("set_adx_wait_long"):
+                        data = entry_updates["set_adx_wait_long"]
+                        state_manager.set_adx_wait_long(data["bars"], data["trigger"])
+                    if entry_updates.get("clear_adx_wait_long"):
+                        state_manager.clear_adx_wait_long()
+                    if entry_updates.get("decrement_adx_wait_long"):
+                        state_manager.decrement_adx_wait_long()
+                    if entry_updates.get("set_adx_wait_short"):
+                        data = entry_updates["set_adx_wait_short"]
+                        state_manager.set_adx_wait_short(data["bars"], data["trigger"])
+                    if entry_updates.get("clear_adx_wait_short"):
+                        state_manager.clear_adx_wait_short()
+                    if entry_updates.get("decrement_adx_wait_short"):
+                        state_manager.decrement_adx_wait_short()
+                    if entry_updates.get("set_volume_wait_long"):
+                        d = entry_updates["set_volume_wait_long"]
+                        state_manager.set_volume_wait_long(d["remaining"], d["trigger"], d["kind"])
+                    if entry_updates.get("set_volume_wait_short"):
+                        d = entry_updates["set_volume_wait_short"]
+                        state_manager.set_volume_wait_short(d["remaining"], d["trigger"], d["kind"])
+                    if entry_updates.get("clear_pending_volume_long"):
+                        state_manager.clear_volume_wait_long()
+                    if entry_updates.get("clear_pending_volume_short"):
+                        state_manager.clear_volume_wait_short()
+                    if entry_updates.get("decrement_volume_wait_long"):
+                        state_manager.decrement_volume_wait_long()
+                    if entry_updates.get("decrement_volume_wait_short"):
+                        state_manager.decrement_volume_wait_short()
+                    if entry_signal:
+                        is_long = entry_signal.signal_type == SignalType.BUY
+                        direction = "LONG" if is_long else "SHORT"
+
+                        dashboard.print_event("ENTRY", f"LIVE {direction} @ {entry_signal.price:.2f}")
+
+                        stop_loss, take_profit = signal_engine.calculate_exit_levels(
+                            entry_price=entry_signal.price,
+                            is_long=is_long
+                        )
+
+                        await order_manager.place_market_order(
+                            action="BUY" if is_long else "SELL",
+                            quantity=contracts
+                        )
+
+                        trade_id = state_manager.state.trade_count + 1
+
+                        dashboard.on_entry(
+                            trade_id=trade_id,
+                            direction=direction,
+                            entry_price=entry_signal.price,
+                            quantity=contracts,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit
+                        )
+
+                        state_manager.on_entry(entry_signal, stop_loss, take_profit)
+
+                        logger.info(
+                            "ORDER_ENTRY | mode=LIVE | contract=%s | direction=%s | entry_price=%.4f | "
+                            "qty=%s | SL=%.4f | TP=%.4f | trigger=%s | trade_id=%s",
+                            contract_label,
+                            direction,
+                            entry_signal.price,
+                            contracts,
+                            stop_loss,
+                            take_profit,
+                            entry_signal.trigger,
+                            trade_id,
+                        )
+
+                        await telegram.notify_trade_placed(
+                            direction=direction,
+                            entry_price=entry_signal.price,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            contracts=contracts,
+                            trigger=entry_signal.trigger,
+                            trade_id=trade_id
+                        )
+            except Exception as e:
+                logger.exception("Live on_bar_close failed: %s", e)
+
         primary_feed.on_bar_close(lambda df, bar: asyncio.create_task(on_bar_close(df, bar)))
         primary_feed.on_bar_update(on_bar_update)
         
         await primary_feed.start(initial_lookback_days=15)
+        seed_dashboard_prices_from_feed(dashboard, primary_feed)
+        _df_live = primary_feed.get_dataframe()
+        logger.info(
+            "Realtime feed ready: %s buffered bars; dashboard seeded from last OHLC row",
+            len(_df_live) if _df_live is not None else 0,
+        )
         
         dashboard_task = asyncio.create_task(update_dashboard_loop())
         
@@ -1514,7 +1683,7 @@ async def run_live_trading_v2(config: dict) -> None:
         )
         
         print("\n" + "=" * 60)
-        print("[OK] 🔴 LIVE TRADING IS ACTIVE - REAL MONEY")
+        print("[OK] LIVE TRADING IS ACTIVE - REAL MONEY")
         print("=" * 60)
         print(f"[OK] Connected via {gateway_type} (Port {port})")
         print("[OK] Dashboard will refresh every 5 seconds")
@@ -1553,8 +1722,8 @@ async def run_live_trading_v2(config: dict) -> None:
         await telegram.shutdown()
 
 
-# Import original backtest functions
-from main import run_backtest, run_databento_backtest
+# Import shared backtest selector
+from main import run_backtest_selection
 
 
 async def main_async():
@@ -1575,11 +1744,11 @@ async def main_async():
     gateway_type = ibkr_cfg.get('connection', {}).get('default_gateway', 'tws').upper()
     
     print("v2.1 Features:")
-    print("  ✓ Auto-reconnect when TWS/Gateway disconnects")
-    print("  ✓ Market orders for faster execution")
-    print("  ✓ Clean terminal dashboard with P&L tracking")
-    print(f"  ✓ IB Gateway support ({gateway_type}) for 24/7 operation")
-    print("  ✓ Telegram notifications (trades, P&L, connection status)")
+    print("  [OK] Auto-reconnect when TWS/Gateway disconnects")
+    print("  [OK] Market orders for faster execution")
+    print("  [OK] Clean terminal dashboard with P&L tracking")
+    print(f"  [OK] IB Gateway support ({gateway_type}) for 24/7 operation")
+    print("  [OK] Telegram notifications (trades, P&L, connection status)")
     print()
     
     # Get user choice
@@ -1589,12 +1758,10 @@ async def main_async():
         print("\nGoodbye!")
         return
     elif choice == '1':
-        await run_backtest(config)
+        await run_backtest_selection(config)
     elif choice == '2':
-        await run_databento_backtest(config)
-    elif choice == '3':
         await run_paper_trading_v2(config)
-    elif choice == '4':
+    elif choice == '3':
         await run_live_trading_v2(config)
     
     print("\n" + "=" * 60)
