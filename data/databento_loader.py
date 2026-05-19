@@ -178,11 +178,7 @@ def load_databento_data(
     
     # === FILTER OUT BAD PRICE DATA ===
     # Keep a broad, root-aware sanity range to catch corrupted rows.
-    price_bounds = {
-        "MNQ": (10_000, 50_000),
-        "MGC": (500, 20_000),
-    }
-    min_price, max_price = price_bounds.get(root, (0, 10_000_000))
+    min_price, max_price = 10_000, 50_000
     initial_count = len(combined_df)
     combined_df = combined_df[
         (combined_df['close'] >= min_price) & 
@@ -199,7 +195,7 @@ def load_databento_data(
     # Use same contract boundary generation as IBKR stitcher.
     print("\n[INFO] Creating stitched continuous contract (CME expiry boundaries)...")
     from data.contract_stitcher import get_contracts_for_date_range
-    contracts_for_range = get_contracts_for_date_range(start_date, end_date, root=root)
+    contracts_for_range = get_contracts_for_date_range(start_date, end_date)
     
     def get_front_month_contract(timestamp):
         """Get the front-month contract for a given timestamp.

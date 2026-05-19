@@ -59,7 +59,6 @@ dmypy.json
 .pylint.d/
 
 # ─── IDEs & Editors ───────────────────────────────────────────────────────────
-.vscode/
 .idea/
 *.sublime-project
 *.sublime-workspace
@@ -77,3 +76,7 @@ desktop.ini
 .claude/
 README.md
 IBKR historic data/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore

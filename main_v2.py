@@ -294,7 +294,7 @@ def create_telegram_notifier(config: dict) -> 'TelegramNotifier':
 def get_menu_choice() -> str:
     """Display main menu and get user choice."""
     print("What would you like to do?\n")
-    print("  [1] Backtest - Choose market (Nasdaq/Gold) and source (Databento/IBKR)")
+    print("  [1] Backtest - Test strategy on historical data (Databento/IBKR)")
     print("  [2] Paper Trade - Trade on IBKR paper account (with Dashboard)")
     print("  [3] Live Trade - Trade with REAL money (with Dashboard)")
     print("  [0] Exit")
