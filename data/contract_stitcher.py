@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 QUARTER_MONTHS = [3, 6, 9, 12]
 MNQ_MONTH_CODE = {3: "H", 6: "M", 9: "U", 12: "Z"}
-MGC_BIMONTHLY_MONTHS = [2, 4, 6, 8, 10, 12]
-MGC_MONTH_CODE = {2: "G", 4: "J", 6: "M", 8: "Q", 10: "V", 12: "Z"}
+CONTRACT_ROOT = "MNQ"
+EXCHANGE = "CME"
 
 
 def _third_friday(year: int, month: int) -> datetime:
@@ -43,29 +43,6 @@ def _expiry_boundary_datetime(year: int, month: int) -> datetime:
     return datetime(expiry_day.year, expiry_day.month, expiry_day.day, 23, 59, 59)
 
 
-def _third_to_last_business_day(year: int, month: int) -> datetime:
-    """
-    Return the third-to-last business day (Mon-Fri) for a given month.
-    """
-    if month == 12:
-        cursor = datetime(year + 1, 1, 1) - timedelta(days=1)
-    else:
-        cursor = datetime(year, month + 1, 1) - timedelta(days=1)
-
-    business_days_seen = 0
-    while True:
-        if cursor.weekday() < 5:  # Monday-Friday
-            business_days_seen += 1
-            if business_days_seen == 3:
-                return cursor
-        cursor -= timedelta(days=1)
-
-
-def _mgc_expiry_boundary_datetime(year: int, month: int) -> datetime:
-    expiry_day = _third_to_last_business_day(year, month)
-    return datetime(expiry_day.year, expiry_day.month, expiry_day.day, 23, 59, 59)
-
-
 def _prev_cycle_month(year: int, month: int, cycle_months: List[int]) -> Tuple[int, int]:
     idx = cycle_months.index(month)
     if idx == 0:
@@ -80,37 +57,16 @@ def _contract_symbol(root: str, year: int, month: int, month_code: dict) -> str:
 def get_contracts_for_date_range(
     start_date: datetime,
     end_date: datetime,
-    root: str = "MNQ",
-) -> List[Tuple[str, datetime, datetime]]:
+) -> List[Tuple[str, datetime, datetime, str]]:
     """
-    Determine which MNQ contracts cover the given date range.
-    
-    Parameters:
-    -----------
-    start_date : datetime
-        Start of the date range
-    end_date : datetime
-        End of the date range
-    
-    Returns:
-    --------
-    List[Tuple[str, datetime, datetime]]
-        List of (contract_symbol, contract_start, contract_end) tuples
+    Determine which MNQ quarterly contracts cover the given date range.
     """
     contracts_needed = []
-    root = (root or "MNQ").upper()
-    if root == "MNQ":
-        cycle_months = QUARTER_MONTHS
-        month_code = MNQ_MONTH_CODE
-        boundary_fn = _expiry_boundary_datetime
-        expiry_label_fn = _third_friday
-    elif root == "MGC":
-        cycle_months = MGC_BIMONTHLY_MONTHS
-        month_code = MGC_MONTH_CODE
-        boundary_fn = _mgc_expiry_boundary_datetime
-        expiry_label_fn = _third_to_last_business_day
-    else:
-        raise ValueError(f"Unsupported contract root: {root}")
+    cycle_months = QUARTER_MONTHS
+    month_code = MNQ_MONTH_CODE
+    boundary_fn = _expiry_boundary_datetime
+    expiry_label_fn = _third_friday
+    root = CONTRACT_ROOT
 
     # Make dates timezone-naive for comparison
     if hasattr(start_date, 'tzinfo') and start_date.tzinfo is not None:
@@ -151,8 +107,7 @@ async def fetch_stitched_data(
     start_date: datetime,
     end_date: datetime,
     bar_size: str = "10 mins",
-    root: str = "MNQ",
-    exchange: str = "CME",
+    exchange: str = EXCHANGE,
 ) -> pd.DataFrame:
     """
     Fetch historical data from multiple MNQ contracts and stitch together.
@@ -176,7 +131,8 @@ async def fetch_stitched_data(
     from ib_async import Future
     
     # Get list of contracts needed
-    contracts_needed = get_contracts_for_date_range(start_date, end_date, root=root)
+    contracts_needed = get_contracts_for_date_range(start_date, end_date)
+    root = CONTRACT_ROOT
     
     if not contracts_needed:
         logger.error(f"No contracts found for date range {start_date} to {end_date}")
@@ -195,7 +151,7 @@ async def fetch_stitched_data(
         is_expired = datetime.strptime(expiry, '%Y%m%d') < datetime.now()
         
         contract = Future(
-            symbol=root.upper(),
+            symbol=CONTRACT_ROOT,
             exchange=exchange,
             currency='USD',
             lastTradeDateOrContractMonth=expiry,

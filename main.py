@@ -87,7 +87,7 @@ def load_config(config_dir: str = "./config") -> dict:
 def get_menu_choice() -> str:
     """Display main menu and get user choice."""
     print("What would you like to do?\n")
-    print("  [1] Backtest - Choose market (MNQ/MGC) and source (Databento/IBKR)")
+    print("  [1] Backtest - Test strategy on historical data (Databento/IBKR)")
     print("  [2] Paper Trade - Trade on IBKR paper account")
     print("  [3] Live Trade - Trade with REAL money")
     print("  [0] Exit")
@@ -153,21 +153,6 @@ def get_contracts() -> int:
             print("Please enter a valid number.")
 
 
-def get_backtest_market_choice() -> str:
-    """Select backtest market root."""
-    print("\nSelect market for backtesting:\n")
-    print("  [1] Nasdaq Micro E-mini (MNQ)")
-    print("  [2] Micro Gold Futures (MGC)")
-    print()
-    while True:
-        choice = input("Enter market choice (1-2): ").strip()
-        if choice == "1":
-            return "MNQ"
-        if choice == "2":
-            return "MGC"
-        print("Invalid choice. Please enter 1 or 2.")
-
-
 def get_backtest_source_choice() -> str:
     """Select data source for backtest."""
     print("\nSelect backtest data source:\n")
@@ -182,16 +167,15 @@ def get_backtest_source_choice() -> str:
 
 
 async def run_backtest_selection(config: dict) -> None:
-    """Interactive market + source selector for backtesting."""
-    market_root = get_backtest_market_choice()
+    """Interactive data source selector for MNQ backtesting."""
     source_choice = get_backtest_source_choice()
     if source_choice == "1":
-        await run_databento_backtest(config, market_root=market_root)
+        await run_databento_backtest(config)
     else:
-        await run_backtest(config, market_root=market_root)
+        await run_backtest(config)
 
 
-async def run_databento_backtest(config: dict, market_root: str = "MNQ") -> None:
+async def run_databento_backtest(config: dict) -> None:
     """Run backtest using local Databento CSV files."""
     from data.databento_loader import (
         get_available_date_range, 
@@ -201,9 +185,8 @@ async def run_databento_backtest(config: dict, market_root: str = "MNQ") -> None
     from backtest import BacktestEngine, BacktestConfig
     from utils.strategy_side_config import signal_engine_kwargs
     
-    market_root = (market_root or "MNQ").upper()
-    market_name = "Nasdaq Micro E-mini (MNQ)" if market_root == "MNQ" else "Micro Gold Futures (MGC)"
-    databento_dir = DATABENTO_DIR if market_root == "MNQ" else "monthly_splits"
+    market_name = "Nasdaq Micro E-mini (MNQ)"
+    databento_dir = DATABENTO_DIR
 
     print("\n" + "=" * 60)
     print(f"      DATABENTO BACKTEST MODE - {market_name}")
@@ -280,9 +263,9 @@ async def run_databento_backtest(config: dict, market_root: str = "MNQ") -> None
         df_10m = prepare_databento_for_backtest(
             start_date=start_date,
             end_date=end_date,
-            symbol_filter=market_root,
+            symbol_filter="MNQ",
             data_dir=databento_dir,
-            contract_root=market_root,
+            contract_root="MNQ",
             primary_resample_rule=primary_resample,
             strategy_cfg=strategy_cfg,
             ema_length=ema_cfg.get('length', 200),
@@ -367,24 +350,17 @@ async def run_databento_backtest(config: dict, market_root: str = "MNQ") -> None
         traceback.print_exc()
 
 
-async def run_backtest(config: dict, market_root: str = "MNQ") -> None:
+async def run_backtest(config: dict) -> None:
     """Run backtest mode with interactive inputs."""
     from ib_async import IB, Future, ContFuture
     from data import HistoricalDataLoader
     from backtest import BacktestEngine, BacktestConfig
     from utils.strategy_side_config import signal_engine_kwargs
     
-    market_root = (market_root or "MNQ").upper()
-    if market_root == "MNQ":
-        market_name = "Nasdaq Micro E-mini (MNQ)"
-        ibkr_exchange = "CME"
-        cont_symbol = "MNQ1! (Continuous)"
-        stitched_symbol = "MNQ (Stitched Continuous)"
-    else:
-        market_name = "Micro Gold Futures (MGC)"
-        ibkr_exchange = "COMEX"
-        cont_symbol = "MGC1! (Continuous)"
-        stitched_symbol = "MGC (Stitched Continuous)"
+    market_name = "Nasdaq Micro E-mini (MNQ)"
+    ibkr_exchange = "CME"
+    cont_symbol = "MNQ1! (Continuous)"
+    stitched_symbol = "MNQ (Stitched Continuous)"
 
     print("\n" + "=" * 60)
     print(f"            BACKTEST MODE - {market_name}")
@@ -429,7 +405,7 @@ async def run_backtest(config: dict, market_root: str = "MNQ") -> None:
             # Short period: Use ContFuture (Continuous Futures)
             print(f"\n[INFO] Using Continuous Futures (ContFuture) - like TradingView {cont_symbol}!")
             
-            cont_contract = ContFuture(symbol=market_root, exchange=ibkr_exchange, currency='USD')
+            cont_contract = ContFuture(symbol='MNQ', exchange=ibkr_exchange, currency='USD')
             qualified = await ib.qualifyContractsAsync(cont_contract)
             
             if qualified:
@@ -466,10 +442,7 @@ async def run_backtest(config: dict, market_root: str = "MNQ") -> None:
             # Fetches from multiple expired contracts for complete data
             print(f"\n[INFO] Date range is {days_requested} days")
             print("[INFO] Using CONTRACT STITCHER - fetching from multiple expired contracts...")
-            if market_root == "MNQ":
-                print("[INFO] This will fetch from MNQH5, MNQM5, MNQU5, MNQZ5, MNQH6, etc.")
-            else:
-                print("[INFO] This will fetch from MGCG6, MGCJ6, MGCM6, MGCQ6, MGCV6, MGCZ6, etc.")
+            print("[INFO] This will fetch from MNQH5, MNQM5, MNQU5, MNQZ5, MNQH6, etc.")
             
             from data.contract_stitcher import fetch_stitched_data, get_contracts_for_date_range
             from indicators.ema import calculate_ema, ema_trend_filter
@@ -496,7 +469,7 @@ async def run_backtest(config: dict, market_root: str = "MNQ") -> None:
             print(f"[INFO] (Backtest period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
             
             # Show which contracts will be used (with warmup)
-            contracts_needed = get_contracts_for_date_range(data_start_date, end_date, root=market_root)
+            contracts_needed = get_contracts_for_date_range(data_start_date, end_date)
             print(f"\n[INFO] Will fetch from {len(contracts_needed)} contracts:")
             for symbol, fetch_start, fetch_end, expiry in contracts_needed:
                 print(f"  → {symbol}: {fetch_start.strftime('%Y-%m-%d')} to {fetch_end.strftime('%Y-%m-%d')}")
@@ -509,7 +482,6 @@ async def run_backtest(config: dict, market_root: str = "MNQ") -> None:
                 start_date=data_start_date,  # Include warmup
                 end_date=end_date,
                 bar_size=primary_bar_size,
-                root=market_root,
                 exchange=ibkr_exchange,
             )
             
