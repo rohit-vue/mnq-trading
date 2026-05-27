@@ -78,6 +78,8 @@ class RealtimeFeed:
         # State
         self._is_running = False
         self._last_bar_time: Optional[datetime] = None
+        self._last_wall_update: Optional[datetime] = None
+        self._bar_update_count: int = 0
         
         # 1H bar tracking for multi-timeframe
         self._1h_bars: deque = deque(maxlen=300)
@@ -130,7 +132,19 @@ class RealtimeFeed:
         self._build_dataframe()
 
         self._is_running = True
+        self._last_wall_update = datetime.now(self.timezone)
+        if self._bars:
+            self._last_bar_time = pd.Timestamp(self._bars[-1].date)
+            if self._last_bar_time.tzinfo is None:
+                self._last_bar_time = self._last_bar_time.tz_localize('UTC')
+            self._last_bar_time = self._last_bar_time.tz_convert(self.timezone)
         logger.info(f"Real-time feed started with {len(self._bars)} initial bars")
+        
+    async def restart(self, initial_lookback_days: int = 10) -> None:
+        """Stop and resubscribe to historical streaming bars (recover from stale feed)."""
+        logger.info("Restarting real-time feed subscription...")
+        await self.stop()
+        await self.start(initial_lookback_days=initial_lookback_days)
         
     async def stop(self) -> None:
         """Stop the real-time feed and clean up."""
@@ -155,8 +169,14 @@ class RealtimeFeed:
         """
         if not bars:
             return
-        
+
+        self._last_wall_update = datetime.now(self.timezone)
+        self._bar_update_count += 1
         current_bar = bars[-1]
+        bar_ts = pd.Timestamp(current_bar.date)
+        if bar_ts.tzinfo is None:
+            bar_ts = bar_ts.tz_localize('UTC')
+        self._last_bar_time = bar_ts.tz_convert(self.timezone)
         
         # Check if new bar added (previous bar closed)
         if has_new_bar:
@@ -168,6 +188,15 @@ class RealtimeFeed:
             # Notify bar close callbacks
             closed_bar = bars[-2] if len(bars) >= 2 else None
             if closed_bar:
+                logger.info(
+                    "Bar closed: %s | O=%.2f H=%.2f L=%.2f C=%.2f | bars=%s",
+                    closed_bar.date,
+                    closed_bar.open,
+                    closed_bar.high,
+                    closed_bar.low,
+                    closed_bar.close,
+                    len(bars),
+                )
                 self._emit_bar_close(closed_bar)
             
             # Check for 1H bar close
@@ -309,6 +338,25 @@ class RealtimeFeed:
         """
         self._on_bar_update_callbacks.append(callback)
     
+    def last_bar_datetime(self) -> Optional[datetime]:
+        """Timestamp of the latest bar in the buffer (may be the forming bar)."""
+        if self._last_bar_time is not None:
+            return self._last_bar_time.to_pydatetime()
+        if self._df is not None and len(self._df) > 0:
+            ts = self._df.index[-1]
+            return ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts
+        return None
+
+    def minutes_since_last_bar(self) -> Optional[float]:
+        """Minutes since the latest bar timestamp (None if unknown)."""
+        last = self.last_bar_datetime()
+        if last is None:
+            return None
+        now = datetime.now(self.timezone)
+        if last.tzinfo is None:
+            last = self.timezone.localize(last)
+        return (now - last).total_seconds() / 60.0
+
     def get_dataframe(self) -> Optional[pd.DataFrame]:
         """
         Get the current bar DataFrame.

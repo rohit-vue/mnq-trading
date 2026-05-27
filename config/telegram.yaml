@@ -25,5 +25,10 @@ notifications:
   running_pnl:
     enabled: true
     interval_seconds: 3600
+  # Periodic market snapshot (price, ST, EMA, ADX, position) while bot is running
+  market_status_hourly: true
+  market_status_interval_seconds: 3600  # 1 hour
+  # Alert when SuperTrend flips on a completed primary bar
+  supertrend_flip: true
   connection_status: true
   errors: true

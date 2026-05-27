@@ -66,6 +66,9 @@ class TelegramNotifier:
         self.notify_running_pnl = True
         self.notify_connection = True
         self.notify_errors = True
+        self.notify_market_hourly = True
+        self.notify_supertrend_flip = True
+        self.market_status_interval = 3600  # seconds (1 hour)
         self.pnl_interval = 60  # seconds
         
         # Running P&L task
@@ -582,6 +585,86 @@ class TelegramNotifier:
         
         await self.send_message(msg)
     
+    async def notify_market_status(
+        self,
+        mode: str,
+        symbol: str,
+        price: float,
+        st_direction: str,
+        ema_status: str,
+        adx: float,
+        last_bar_ts: str,
+        bar_stale_min: Optional[float] = None,
+        position_size: int = 0,
+        entry_price: float = 0.0,
+        feed_bars: int = 0,
+        market_open: bool = True,
+    ) -> None:
+        """Send periodic market status snapshot (hourly by default)."""
+        if not self.notify_market_hourly:
+            return
+
+        now = datetime.now(self.timezone)
+        pos_line = "FLAT"
+        if position_size > 0:
+            pos_line = f"LONG {abs(position_size)} @ {entry_price:,.2f}"
+        elif position_size < 0:
+            pos_line = f"SHORT {abs(position_size)} @ {entry_price:,.2f}"
+
+        stale_line = ""
+        if bar_stale_min is not None:
+            stale_emoji = "⚠️" if bar_stale_min > 25 else "✅"
+            stale_line = f"\n{stale_emoji} Last bar age: <b>{bar_stale_min:.0f} min</b>"
+
+        session = "OPEN" if market_open else "CLOSED (maintenance/weekend)"
+
+        msg = (
+            f"📊 <b>MARKET STATUS — {symbol}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"🤖 Mode: <b>{mode}</b>\n"
+            f"🕐 Session: <b>{session}</b>\n"
+            f"💹 Price: <code>{price:,.2f}</code>\n"
+            f"📈 SuperTrend: <b>{st_direction}</b>\n"
+            f"📉 EMA filter: <b>{ema_status}</b>\n"
+            f"📐 ADX: <b>{adx:.1f}</b>\n"
+            f"📍 Position: <b>{pos_line}</b>\n"
+            f"🕯 Last bar: <code>{last_bar_ts}</code>\n"
+            f"📚 Buffered bars: <b>{feed_bars}</b>"
+            f"{stale_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_message(msg)
+
+    async def notify_supertrend_flip(
+        self,
+        direction: str,
+        price: float,
+        bar_time: str,
+        ema_status: str,
+        adx: float,
+        mode: str,
+        symbol: str = "MNQ",
+    ) -> None:
+        """Send alert when SuperTrend flips on a completed primary bar."""
+        if not self.notify_supertrend_flip:
+            return
+
+        emoji = "🟢" if direction.upper() == "BULLISH" else "🔴"
+        now = datetime.now(self.timezone)
+        msg = (
+            f"{emoji} <b>SUPERTREND FLIP — {direction.upper()}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"🤖 Mode: <b>{mode}</b> | {symbol}\n"
+            f"🕯 Bar close: <code>{bar_time}</code>\n"
+            f"💹 Close: <code>{price:,.2f}</code>\n"
+            f"📉 EMA filter: <b>{ema_status}</b>\n"
+            f"📐 ADX: <b>{adx:.1f}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_message(msg)
+
     def update_current_price(self, price: float) -> None:
         """
         Update the current price for P&L calculations.

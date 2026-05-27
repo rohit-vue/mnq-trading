@@ -73,6 +73,44 @@ def contract_label_from_ib(contract: Any) -> str:
     return str(sym) if sym else "UNKNOWN"
 
 
+async def ensure_market_data(ib, contract: Any, ibkr_cfg: dict) -> Any:
+    """
+    Subscribe to MNQ quotes so keepUpToDate bars stream and IBKR allows orders (avoids Error 354).
+
+    Requires delayed data enabled in TWS/Gateway if you do not have a live CME subscription.
+    """
+    data_cfg = ibkr_cfg.get("data", {})
+    delayed_cfg = data_cfg.get("delayed_data", {})
+    accept_delayed = delayed_cfg.get("accept", True)
+    ib.reqMarketDataType(3 if accept_delayed else 1)
+    ticker = ib.reqMktData(contract, "", False, False)
+    for _ in range(40):
+        await asyncio.sleep(0.5)
+        last = ticker.last
+        if last is not None and last == last:  # not NaN
+            logger.info(
+                "Market data active: last=%s bid=%s ask=%s (type=%s)",
+                last,
+                ticker.bid,
+                ticker.ask,
+                "delayed" if accept_delayed else "live",
+            )
+            return ticker
+        close = ticker.close
+        if close is not None and close == close:
+            logger.info("Market data active (close=%s)", close)
+            return ticker
+    if delayed_cfg.get("warn_user", True):
+        msg = (
+            "No MNQ market data ticks received. In TWS/Gateway enable delayed market data "
+            "(Global Configuration -> Market Data) or subscribe to CME Nasdaq futures. "
+            "Until quotes flow, orders may be rejected (IB Error 354) and bars may not update."
+        )
+        logger.warning(msg)
+        print(f"\n[!] {msg}\n")
+    return ticker
+
+
 def resolve_ib_client_id(conn_cfg: dict) -> int:
     """
     IBKR allows one socket per (host, port, client_id). Error 326 means ID is already in use.
@@ -148,15 +186,18 @@ def log_price_poll_snapshot(
             prev_closed_ts = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
 
     conn_ib = ib_connected if ib_connected is not None else dashboard.is_connected
+    bar_age_min = feed.minutes_since_last_bar() if feed is not None else None
+    bar_age_s = f"{bar_age_min:.0f}" if bar_age_min is not None else "n/a"
 
     logger.info(
         "PRICE_POLL | mode=%s | contract=%s | stream_price=%.4f | strategy_last_bar_ts=%s | "
-        "bars=%s | df_last_close=%.4f | df_last_ts=%s | prev_completed_close=%.4f | prev_completed_ts=%s | "
-        "ST=%s | EMA_side=%s | ADX=%.2f | ib_connected=%s | dashboard_conn_flag=%s",
+        "bar_age_min=%s | bars=%s | df_last_close=%.4f | df_last_ts=%s | prev_completed_close=%.4f | "
+        "prev_completed_ts=%s | ST=%s | EMA_side=%s | ADX=%.2f | ib_connected=%s | dashboard_conn_flag=%s",
         mode,
         contract_label,
         float(dashboard.current_price),
         lb_text,
+        bar_age_s,
         n_bars,
         df_last_c,
         df_last_ts,
@@ -196,6 +237,239 @@ def log_bar_close_snapshot(mode: str, contract_label: str, bar: Any) -> None:
         lo,
         c,
         vol_s,
+    )
+
+
+def read_ib_ticker_price(ticker: Any) -> Optional[float]:
+    """Best available MNQ price from an IB market data ticker."""
+    if ticker is None:
+        return None
+    for attr in ("last", "close", "marketPrice"):
+        val = getattr(ticker, attr, None)
+        if val is not None and val == val:
+            return float(val)
+    bid = getattr(ticker, "bid", None)
+    ask = getattr(ticker, "ask", None)
+    if bid is not None and ask is not None and bid == bid and ask == ask:
+        return float((bid + ask) / 2.0)
+    return None
+
+
+def primary_bar_stale_minutes(bar_size: str) -> float:
+    """Minutes without a new bar before we treat the IB stream as stale."""
+    size = (bar_size or "10 mins").lower()
+    if "5 min" in size:
+        return 15.0
+    if "15 min" in size:
+        return 35.0
+    if "30 min" in size:
+        return 65.0
+    if "1 hour" in size or "60" in size:
+        return 125.0
+    return 25.0  # default 10m
+
+
+async def refresh_feed_if_stale(
+    feed: Any,
+    bar_size: str,
+    *,
+    mode_label: str,
+    only_when_market_open: bool = True,
+) -> bool:
+    """Restart IB keepUpToDate subscription when bars stop advancing."""
+    if feed is None:
+        return False
+    stale_limit = primary_bar_stale_minutes(bar_size)
+    age = feed.minutes_since_last_bar()
+    if age is None or age < stale_limit:
+        return False
+    if only_when_market_open and not feed.is_market_hours(check_rth=False):
+        return False
+    logger.warning(
+        "Feed stale (last bar %.0f min ago, limit %.0f) — restarting %s stream",
+        age,
+        stale_limit,
+        mode_label,
+    )
+    await feed.restart(initial_lookback_days=5)
+    return True
+
+
+def refresh_dashboard_indicators_from_feed(
+    feed: Any,
+    mtf: Any,
+    dashboard: Any,
+    strategy_cfg: dict,
+    sides: dict,
+    ema_cfg: dict,
+) -> bool:
+    """
+    Recompute ST / EMA / ADX on the last closed bar for dashboard display.
+    Does not place orders — used when the feed was stale or between bar closes.
+    """
+    from data.live_bar_alignment import enrich_10m_with_1h_like_backtest
+    from data.strategy_indicators import live_bar_indicator_slice
+
+    df = feed.get_dataframe() if feed is not None else None
+    if df is None or len(df) < 60:
+        return False
+    try:
+        inds = live_bar_indicator_slice(
+            df,
+            sides["long_supertrend_entry"],
+            sides["short_supertrend_entry"],
+            sides["long_adx"],
+            sides["short_adx"],
+            long_supertrend_exit=sides["long_supertrend_exit"],
+            short_supertrend_exit=sides["short_supertrend_exit"],
+            row_i=-2,
+        )
+        df_1h = mtf.aggregate_1h_from_10m(df)
+        df_aligned = enrich_10m_with_1h_like_backtest(df, df_1h, ema_cfg.get("length", 200))
+        current_bar = df_aligned.iloc[-2].copy()
+        for k, v in inds.items():
+            current_bar[k] = v
+        st_dir = (
+            "BULL"
+            if current_bar.get("direction_long", current_bar.get("direction", 0)) == -1
+            else "BEAR"
+        )
+        ema_status = (
+            "BULL"
+            if current_bar.get("ema_bull")
+            else ("BEAR" if current_bar.get("ema_bear") else "NEUTRAL")
+        )
+        adx_val = float(current_bar.get("adx", 0) or 0)
+        dashboard.update_price(float(current_bar["close"]), current_bar.name)
+        dashboard.update_indicators(st_dir, ema_status, adx_val)
+        return True
+    except Exception as e:
+        logger.debug("Dashboard indicator refresh failed: %s", e)
+        return False
+
+
+async def maybe_send_hourly_market_status(
+    telegram: Any,
+    dashboard: Any,
+    feed: Any,
+    state_manager: Any,
+    *,
+    mode_label: str,
+    symbol: str,
+    last_sent: Optional[datetime],
+    interval_sec: int,
+) -> Optional[datetime]:
+    """Send Telegram market snapshot once per interval."""
+    if not telegram.enabled or not telegram.notify_market_hourly:
+        return last_sent
+    now = datetime.now(pytz.timezone("US/Eastern"))
+    if last_sent is not None:
+        elapsed = (now - last_sent).total_seconds()
+        if elapsed < interval_sec:
+            return last_sent
+    state = state_manager.state if state_manager else None
+    pos = int(state.position_size) if state else 0
+    entry = float(state.entry_price) if state and state.entry_price else 0.0
+    lb = dashboard.last_bar_time
+    lb_text = lb.isoformat() if lb is not None and hasattr(lb, "isoformat") else str(lb or "n/a")
+    stale_min = feed.minutes_since_last_bar() if feed else None
+    n_bars = len(feed.get_dataframe()) if feed and feed.get_dataframe() is not None else 0
+    market_open = feed.is_market_hours(check_rth=False) if feed else True
+    await telegram.notify_market_status(
+        mode=mode_label,
+        symbol=symbol,
+        price=float(dashboard.current_price),
+        st_direction=dashboard.st_direction,
+        ema_status=dashboard.ema_status,
+        adx=float(dashboard.adx_value),
+        last_bar_ts=lb_text,
+        bar_stale_min=stale_min,
+        position_size=pos,
+        entry_price=entry,
+        feed_bars=n_bars,
+        market_open=market_open,
+    )
+    return now
+
+
+async def handle_supertrend_flip_telegram(
+    telegram: Any,
+    current_bar: Any,
+    *,
+    mode_label: str,
+    contract_label: str,
+) -> None:
+    """Notify Telegram when a completed bar flips SuperTrend."""
+    if current_bar.get("st_bull_flip", False):
+        direction = "BULLISH"
+    elif current_bar.get("st_bear_flip", False):
+        direction = "BEARISH"
+    else:
+        return
+    ts = current_bar.name
+    ts_text = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+    ema_status = (
+        "BULL"
+        if current_bar.get("ema_bull")
+        else ("BEAR" if current_bar.get("ema_bear") else "NEUTRAL")
+    )
+    adx_val = float(current_bar.get("adx", 0) or 0)
+    await telegram.notify_supertrend_flip(
+        direction=direction,
+        price=float(current_bar["close"]),
+        bar_time=ts_text,
+        ema_status=ema_status,
+        adx=adx_val,
+        mode=mode_label,
+        symbol=contract_label,
+    )
+
+
+async def run_dashboard_maintenance(
+    *,
+    mode_label: str,
+    contract_label: str,
+    dashboard: Any,
+    feed: Any,
+    mtf: Any,
+    telegram: Any,
+    state_manager: Any,
+    strategy_cfg: dict,
+    sides: dict,
+    ema_cfg: dict,
+    primary_bar_size: str,
+    market_ticker: Any,
+    shared_state: dict,
+) -> None:
+    """Ticker price, stale-feed recovery, indicator refresh, hourly Telegram status."""
+    ticker = market_ticker or shared_state.get("market_data_ticker")
+    price = read_ib_ticker_price(ticker)
+    if price is not None:
+        telegram.update_current_price(price)
+        dashboard.update_price(price)
+
+    refreshed = await refresh_feed_if_stale(
+        feed,
+        primary_bar_size,
+        mode_label=mode_label,
+    )
+    if refreshed:
+        seed_dashboard_prices_from_feed(dashboard, feed)
+
+    refresh_dashboard_indicators_from_feed(
+        feed, mtf, dashboard, strategy_cfg, sides, ema_cfg
+    )
+
+    key = f"last_hourly_market_{mode_label}"
+    shared_state[key] = await maybe_send_hourly_market_status(
+        telegram,
+        dashboard,
+        feed,
+        state_manager,
+        mode_label=mode_label,
+        symbol=contract_label,
+        last_sent=shared_state.get(key),
+        interval_sec=telegram.market_status_interval,
     )
 
 
@@ -286,7 +560,10 @@ def create_telegram_notifier(config: dict) -> 'TelegramNotifier':
     
     pnl_cfg = tg_notify.get('running_pnl', {})
     notifier.notify_running_pnl = pnl_cfg.get('enabled', True)
-    notifier.pnl_interval = pnl_cfg.get('interval_seconds', 60)
+    notifier.pnl_interval = pnl_cfg.get('interval_seconds', 3600)
+    notifier.notify_market_hourly = tg_notify.get('market_status_hourly', True)
+    notifier.notify_supertrend_flip = tg_notify.get('supertrend_flip', True)
+    notifier.market_status_interval = int(tg_notify.get('market_status_interval_seconds', 3600))
     
     return notifier
 
@@ -715,6 +992,8 @@ async def run_paper_trading_v2(config: dict) -> None:
         shared_state['contract'] = contract
         print(f"[OK] Trading: {contract.localSymbol}")
         contract_label = contract_label_from_ib(contract)
+
+        shared_state["market_data_ticker"] = await ensure_market_data(ib, contract, ibkr_cfg)
         
         # Initialize components
         signal_engine = SignalEngine(
@@ -790,6 +1069,21 @@ async def run_paper_trading_v2(config: dict) -> None:
                     )
                     ib_connected = ib.isConnected()
                     dashboard.update_connection_status(ib_connected)
+                    await run_dashboard_maintenance(
+                        mode_label="PAPER",
+                        contract_label=contract_label,
+                        dashboard=dashboard,
+                        feed=primary_feed,
+                        mtf=mtf,
+                        telegram=telegram,
+                        state_manager=state_manager,
+                        strategy_cfg=strategy_cfg,
+                        sides=sides,
+                        ema_cfg=ema_cfg,
+                        primary_bar_size=primary_bar_size,
+                        market_ticker=shared_state.get("market_data_ticker"),
+                        shared_state=shared_state,
+                    )
                     log_price_poll_snapshot(
                         "PAPER",
                         contract_label,
@@ -868,6 +1162,13 @@ async def run_paper_trading_v2(config: dict) -> None:
                 elif current_bar.get('st_bear_flip', False):
                     events = "SuperTrend flipped BEARISH"
                     dashboard.print_event("SIGNAL", events)
+                if current_bar.get('st_bull_flip', False) or current_bar.get('st_bear_flip', False):
+                    await handle_supertrend_flip_telegram(
+                        telegram,
+                        current_bar,
+                        mode_label="PAPER",
+                        contract_label=contract_label,
+                    )
                 if current_bar.get('ema_bull_cross', False):
                     events = "EMA Cross BULLISH"
                     dashboard.print_event("SIGNAL", events)
@@ -1323,6 +1624,8 @@ async def run_live_trading_v2(config: dict) -> None:
         shared_state['contract'] = contract
         print(f"[OK] Trading: {contract.localSymbol}")
         contract_label = contract_label_from_ib(contract)
+
+        shared_state["market_data_ticker"] = await ensure_market_data(ib, contract, ibkr_cfg)
         
         # Initialize components (same as paper trading)
         signal_engine = SignalEngine(
@@ -1396,6 +1699,21 @@ async def run_live_trading_v2(config: dict) -> None:
                     )
                     ib_connected = ib.isConnected()
                     dashboard.update_connection_status(ib_connected)
+                    await run_dashboard_maintenance(
+                        mode_label="LIVE",
+                        contract_label=contract_label,
+                        dashboard=dashboard,
+                        feed=primary_feed,
+                        mtf=mtf,
+                        telegram=telegram,
+                        state_manager=state_manager,
+                        strategy_cfg=strategy_cfg,
+                        sides=sides,
+                        ema_cfg=ema_cfg,
+                        primary_bar_size=primary_bar_size,
+                        market_ticker=shared_state.get("market_data_ticker"),
+                        shared_state=shared_state,
+                    )
                     log_price_poll_snapshot(
                         "LIVE",
                         contract_label,
@@ -1465,6 +1783,13 @@ async def run_live_trading_v2(config: dict) -> None:
                     dashboard.print_event("SIGNAL", "SuperTrend flipped BULLISH")
                 elif current_bar.get('st_bear_flip', False):
                     dashboard.print_event("SIGNAL", "SuperTrend flipped BEARISH")
+                if current_bar.get('st_bull_flip', False) or current_bar.get('st_bear_flip', False):
+                    await handle_supertrend_flip_telegram(
+                        telegram,
+                        current_bar,
+                        mode_label="LIVE",
+                        contract_label=contract_label,
+                    )
                 if current_bar.get('ema_bull_cross', False):
                     dashboard.print_event("SIGNAL", "EMA Cross BULLISH")
                 elif current_bar.get('ema_bear_cross', False):
