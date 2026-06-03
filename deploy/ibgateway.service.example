@@ -1,0 +1,30 @@
+# Example systemd unit for IB Gateway on Linux VPS.
+# IB Gateway is a GUI app — you need a display (RDP session or Xvfb).
+#
+# Install:
+#   sudo cp ibgateway.service.example /etc/systemd/system/ibgateway.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ibgateway.service
+#
+# If using Xvfb instead of desktop session:
+#   sudo apt install xvfb
+#   Add a separate xvfb.service, then set DISPLAY=:99 below.
+
+[Unit]
+Description=Interactive Brokers Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/IBGateway
+# Match your active desktop session (Remote Desktop often uses :0 or :10)
+Environment=DISPLAY=:0
+ExecStart=/home/trader/IBGateway/ibgateway
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target

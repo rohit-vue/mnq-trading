@@ -18,6 +18,7 @@ Modes:
 =============================================================================
 """
 
+import argparse
 import asyncio
 import logging
 import os
@@ -820,7 +821,7 @@ async def startup_reconcile_position(
     )
 
 
-async def run_paper_trading_v2(config: dict) -> None:
+async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) -> None:
     """
     Run paper trading mode with:
     - Auto-reconnect
@@ -839,7 +840,10 @@ async def run_paper_trading_v2(config: dict) -> None:
     print("             PAPER TRADING MODE v2.0")
     print("=" * 60)
     
-    contracts = get_contracts()
+    if contracts is None:
+        contracts = get_contracts()
+    else:
+        print(f"\nContracts: {contracts} (from command line)")
     
     # Get configs
     ibkr_cfg = config.get('ibkr', {})
@@ -1438,7 +1442,7 @@ async def run_paper_trading_v2(config: dict) -> None:
         await telegram.shutdown()
 
 
-async def run_live_trading_v2(config: dict) -> None:
+async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> None:
     """
     Run live trading mode with:
     - Auto-reconnect
@@ -1471,7 +1475,10 @@ async def run_live_trading_v2(config: dict) -> None:
     
     await asyncio.sleep(5)
     
-    contracts = get_contracts()
+    if contracts is None:
+        contracts = get_contracts()
+    else:
+        print(f"\nContracts: {contracts} (from command line)")
     
     # Get configs
     ibkr_cfg = config.get('ibkr', {})
@@ -2051,8 +2058,31 @@ async def run_live_trading_v2(config: dict) -> None:
 from main import run_backtest_selection
 
 
-async def main_async():
+def parse_cli_args(argv: Optional[list] = None):
+    """Optional non-interactive mode for VPS/systemd (skips menu + contract prompt)."""
+    parser = argparse.ArgumentParser(
+        description="MNQ SuperTrend + EMA trading system",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("paper", "live", "backtest"),
+        help="Run without menu: paper, live, or backtest",
+    )
+    parser.add_argument(
+        "--contracts",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Contract size (default 1 for paper when --mode is set)",
+    )
+    return parser.parse_args(argv)
+
+
+async def main_async(cli_args: Optional[argparse.Namespace] = None):
     """Main async entry point."""
+    if cli_args is None:
+        cli_args = parse_cli_args()
+
     print_banner()
     
     # Load config
@@ -2075,9 +2105,15 @@ async def main_async():
     print(f"  [OK] IB Gateway support ({gateway_type}) for 24/7 operation")
     print("  [OK] Telegram notifications (trades, P&L, connection status)")
     print()
-    
-    # Get user choice
-    choice = get_menu_choice()
+
+    contracts = cli_args.contracts
+    if cli_args.mode:
+        mode_map = {"paper": "2", "live": "3", "backtest": "1"}
+        choice = mode_map[cli_args.mode]
+        if contracts is None and choice in ("2", "3"):
+            contracts = 1
+    else:
+        choice = get_menu_choice()
     
     if choice == '0':
         print("\nGoodbye!")
@@ -2085,9 +2121,9 @@ async def main_async():
     elif choice == '1':
         await run_backtest_selection(config)
     elif choice == '2':
-        await run_paper_trading_v2(config)
+        await run_paper_trading_v2(config, contracts=contracts)
     elif choice == '3':
-        await run_live_trading_v2(config)
+        await run_live_trading_v2(config, contracts=contracts)
     
     print("\n" + "=" * 60)
     print("Session ended. Run 'python main_v2.py' to start again.")
@@ -2096,8 +2132,9 @@ async def main_async():
 
 def main():
     """Main entry point."""
+    cli_args = parse_cli_args()
     try:
-        asyncio.run(main_async())
+        asyncio.run(main_async(cli_args))
     except KeyboardInterrupt:
         print("\n\nInterrupted by user.")
     except Exception as e:

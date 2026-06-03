@@ -1,0 +1,24 @@
+[Unit]
+Description=MNQ SuperTrend Paper Trading Bot
+After=network-online.target
+Wants=network-online.target
+# Uncomment if you run ibgateway.service on the same VPS:
+# After=ibgateway.service
+# Requires=ibgateway.service
+
+[Service]
+Type=simple
+User=trader
+Group=trader
+WorkingDirectory=/home/trader/mnq-trading
+ExecStart=/home/trader/mnq-trading/deploy/run_paper.sh
+Restart=always
+RestartSec=30
+TimeoutStopSec=120
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=append:/home/trader/mnq-trading/logs/bot.stdout.log
+StandardError=append:/home/trader/mnq-trading/logs/bot.stderr.log
+
+[Install]
+WantedBy=multi-user.target
