@@ -31,8 +31,14 @@ symbol_mapping:
 # -----------------------------------------------------------------------------
 rollover:
   enabled: true
-  method: "front_month_auto"
-  days_before_expiry: 3       # Roll 3 days before expiration
+  method: "volume"
+  roll_window_days: 10        # Start volume checks this many days before expiration
+  confirmation_days: 1        # Roll after next contract volume wins this many completed days
+  check_after: "17:00"        # US/Eastern; run one rollover decision after the session day
+  timezone: "US/Eastern"
+  fallback_days_before_expiry: 3  # Hard roll if volume data is unavailable this close to expiry
+  volume_bar_size: "1 day"
+  compare: "daily_volume"
   
   # Contract month codes
   month_codes:

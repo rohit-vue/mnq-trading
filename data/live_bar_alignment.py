@@ -46,6 +46,11 @@ def enrich_10m_with_1h_like_backtest(
 
     out = df_10m.copy()
     out = pd.concat([out, ema_1h, close_1h, high_1h, low_1h, is_new_1h], axis=1)
+    bar_delta = out.index.to_series().diff().median()
+    if pd.isna(bar_delta) or bar_delta <= pd.Timedelta(0):
+        bar_delta = pd.Timedelta("5min")
+    out["primary_bar_minutes"] = bar_delta / pd.Timedelta(minutes=1)
+    out["is_1h_close_bar"] = (out.index + bar_delta).floor("h") != out.index.floor("h")
 
     out["ema_bull"] = out["close_1h"] > out["ema_1h"]
     out["ema_bear"] = out["close_1h"] < out["ema_1h"]

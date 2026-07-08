@@ -266,6 +266,7 @@ async def run_databento_backtest(config: dict) -> None:
             symbol_filter="MNQ",
             data_dir=databento_dir,
             contract_root="MNQ",
+            contract_cfg=contract_cfg,
             primary_resample_rule=primary_resample,
             strategy_cfg=strategy_cfg,
             ema_length=ema_cfg.get('length', 200),
@@ -483,6 +484,7 @@ async def run_backtest(config: dict) -> None:
                 end_date=end_date,
                 bar_size=primary_bar_size,
                 exchange=ibkr_exchange,
+                contract_cfg=contract_cfg,
             )
             
             if len(df_10m) == 0:

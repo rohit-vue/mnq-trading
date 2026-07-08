@@ -70,7 +70,7 @@ async def main() -> None:
     default_mode = conn_cfg.get("default_mode", "paper").lower()
     default_gateway = conn_cfg.get("default_gateway", "tws").lower()
     default_host = conn_cfg.get("host", "127.0.0.1")
-    default_client_id = int(conn_cfg.get("client_id", 1))
+    default_client_id = int(2)
 
     print("=" * 72)
     print("IBKR HISTORICAL DATA EXPORT (STITCHED MNQ CONTRACTS)")

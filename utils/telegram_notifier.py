@@ -17,7 +17,7 @@ Notifications:
 import asyncio
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Callable
 import pytz
 import aiohttp
 
@@ -67,19 +67,63 @@ class TelegramNotifier:
         self.notify_connection = True
         self.notify_errors = True
         self.notify_market_hourly = True
-        self.notify_supertrend_flip = True
+        self.notify_supertrend_flip_enabled = True
+        self.notify_contract_roll_enabled = True
         self.market_status_interval = 3600  # seconds (1 hour)
         self.pnl_interval = 60  # seconds
         
         # Running P&L task
         self._pnl_task: Optional[asyncio.Task] = None
         self._current_trade_info: Optional[Dict[str, Any]] = None
+        self._get_market_price: Optional[Any] = None
         self._running = False
         
         # Session for HTTP requests
         self._session: Optional[aiohttp.ClientSession] = None
+        self._background_tasks: set = set()
         
         logger.info(f"Telegram Notifier initialized (enabled={enabled})")
+
+    def schedule(self, coro) -> None:
+        """Schedule a Telegram coroutine without blocking the caller."""
+        async def _runner():
+            try:
+                await coro
+            except Exception as exc:
+                logger.warning("Telegram notification failed (non-fatal): %s", exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("No event loop — Telegram notification skipped")
+            return
+        task = loop.create_task(_runner())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def set_market_price_provider(self, provider: Any) -> None:
+        """Callable returning (price, source) or price for hourly P&L updates."""
+        self._get_market_price = provider
+
+    def _resolve_current_price(self, trade: Dict[str, Any]) -> tuple[float, str]:
+        """Fresh price for P&L — never rely on a stale cached value at send time."""
+        if self._get_market_price is not None:
+            try:
+                result = self._get_market_price()
+                if isinstance(result, tuple) and len(result) >= 2:
+                    price, source = result[0], result[1]
+                else:
+                    price, source = result, "provider"
+                if price is not None and price == price:
+                    return float(price), str(source)
+            except Exception as exc:
+                logger.debug("Market price provider failed: %s", exc)
+
+        cached = trade.get("current_price")
+        if cached is not None and cached == cached:
+            return float(cached), "cached"
+
+        return float(trade["entry_price"]), "entry_fallback"
     
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session."""
@@ -251,7 +295,8 @@ class TelegramNotifier:
         take_profit: float,
         contracts: int,
         trigger: str = "",
-        trade_id: int = 0
+        trade_id: int = 0,
+        actual_fill_price: Optional[float] = None,
     ) -> None:
         """
         Send trade entry notification.
@@ -279,24 +324,36 @@ class TelegramNotifier:
         now = datetime.now(self.timezone)
         
         direction_emoji = "📈" if direction == "LONG" else "📉"
+        actual_entry_price = (
+            float(actual_fill_price)
+            if actual_fill_price is not None and actual_fill_price == actual_fill_price
+            else None
+        )
+        effective_entry_price = actual_entry_price if actual_entry_price is not None else entry_price
         
         # Calculate risk/reward
         if direction == "LONG":
-            risk_pts = entry_price - stop_loss
-            reward_pts = take_profit - entry_price
+            risk_pts = effective_entry_price - stop_loss
+            reward_pts = take_profit - effective_entry_price
         else:
-            risk_pts = stop_loss - entry_price
-            reward_pts = entry_price - take_profit
+            risk_pts = stop_loss - effective_entry_price
+            reward_pts = effective_entry_price - take_profit
         
         risk_dollars = risk_pts * 2 * contracts
         reward_dollars = reward_pts * 2 * contracts
+        fill_line = (
+            f"✅ Actual Fill: <code>{actual_entry_price:,.2f}</code>\n"
+            if actual_entry_price is not None
+            else "✅ Actual Fill: <i>pending / not reported yet</i>\n"
+        )
         
         msg = (
             f"{direction_emoji} <b>TRADE PLACED - #{trade_id}</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             f"📅 Time: <code>{now.strftime('%Y-%m-%d %H:%M:%S %Z')}</code>\n"
             f"↕️ Direction: <b>{direction}</b>\n"
-            f"💰 Entry Price: <code>{entry_price:,.2f}</code>\n"
+            f"🎯 Intended Entry: <code>{entry_price:,.2f}</code>\n"
+            f"{fill_line}"
             f"📦 Contracts: <b>{contracts}</b>\n"
             "\n"
             "🎯 <b>Exit Levels:</b>\n"
@@ -317,12 +374,17 @@ class TelegramNotifier:
         self._current_trade_info = {
             'trade_id': trade_id,
             'direction': direction,
-            'entry_price': entry_price,
+            'entry_price': effective_entry_price,
+            'intended_entry_price': entry_price,
+            'actual_fill_price': actual_entry_price,
             'stop_loss': stop_loss,
             'take_profit': take_profit,
             'contracts': contracts,
             'entry_time': now
         }
+        init_price, init_src = self._resolve_current_price(self._current_trade_info)
+        self._current_trade_info['current_price'] = init_price
+        self._current_trade_info['price_source'] = init_src
         
         # Start running P&L updates
         if self.notify_running_pnl:
@@ -462,7 +524,15 @@ class TelegramNotifier:
             return
         
         trade = self._current_trade_info
-        current_price = trade.get('current_price', trade['entry_price'])
+        current_price, price_source = self._resolve_current_price(trade)
+        trade["current_price"] = current_price
+        logger.info(
+            "TELEGRAM_PNL | trade=#%s | current=%.2f | source=%s | entry=%.2f",
+            trade.get("trade_id"),
+            current_price,
+            price_source,
+            trade.get("entry_price"),
+        )
         
         direction = trade['direction']
         entry_price = trade['entry_price']
@@ -595,6 +665,7 @@ class TelegramNotifier:
         adx: float,
         last_bar_ts: str,
         bar_stale_min: Optional[float] = None,
+        stream_idle_warn_min: float = 30.0,
         position_size: int = 0,
         entry_price: float = 0.0,
         feed_bars: int = 0,
@@ -613,8 +684,8 @@ class TelegramNotifier:
 
         stale_line = ""
         if bar_stale_min is not None:
-            stale_emoji = "⚠️" if bar_stale_min > 25 else "✅"
-            stale_line = f"\n{stale_emoji} Last bar age: <b>{bar_stale_min:.0f} min</b>"
+            stale_emoji = "⚠️" if bar_stale_min > stream_idle_warn_min else "✅"
+            stale_line = f"\n{stale_emoji} Stream idle: <b>{bar_stale_min:.0f} min</b>"
 
         session = "OPEN" if market_open else "CLOSED (maintenance/weekend)"
 
@@ -647,7 +718,7 @@ class TelegramNotifier:
         symbol: str = "MNQ",
     ) -> None:
         """Send alert when SuperTrend flips on a completed primary bar."""
-        if not self.notify_supertrend_flip:
+        if not self.notify_supertrend_flip_enabled:
             return
 
         emoji = "🟢" if direction.upper() == "BULLISH" else "🔴"
@@ -665,18 +736,48 @@ class TelegramNotifier:
         )
         await self.send_message(msg)
 
-    def update_current_price(self, price: float) -> None:
+    async def notify_contract_roll(
+        self,
+        old_symbol: str,
+        new_symbol: str,
+        reason: str,
+        current_volume: Optional[float] = None,
+        next_volume: Optional[float] = None,
+        mode: str = "PAPER",
+    ) -> None:
+        """Send alert when the bot switches the active futures month."""
+        if not self.notify_contract_roll_enabled:
+            return
+
+        now = datetime.now(self.timezone)
+        vol_line = ""
+        if current_volume is not None and next_volume is not None:
+            vol_line = (
+                f"\n📊 Volume: <code>{old_symbol}={current_volume:,.0f}</code> | "
+                f"<code>{new_symbol}={next_volume:,.0f}</code>"
+            )
+        msg = (
+            "🔁 <b>CONTRACT ROLLOVER</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"🤖 Mode: <b>{mode}</b>\n"
+            f"📦 Old: <code>{old_symbol}</code>\n"
+            f"📦 New: <code>{new_symbol}</code>\n"
+            f"📝 Reason: <b>{reason}</b>"
+            f"{vol_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_message(msg)
+
+    def update_current_price(self, price: float, source: str = "") -> None:
         """
-        Update the current price for P&L calculations.
-        Call this on each bar update or price tick.
-        
-        Parameters:
-        -----------
-        price : float
-            Current market price
+        Update the cached price for P&L calculations.
+        Hourly updates also call the market_price_provider for a fresh quote.
         """
-        if self._current_trade_info:
-            self._current_trade_info['current_price'] = price
+        if self._current_trade_info and price is not None and price == price:
+            self._current_trade_info["current_price"] = float(price)
+            if source:
+                self._current_trade_info["price_source"] = source
     
     # =========================================================================
     # CONNECTION NOTIFICATIONS
@@ -694,29 +795,46 @@ class TelegramNotifier:
         )
         await self.send_message(msg)
     
-    async def notify_disconnected(self, reason: str = "") -> None:
+    async def notify_disconnected(
+        self,
+        reason: str = "",
+        *,
+        mode: str = "",
+        port: Optional[int] = None,
+        gateway_type: str = "TWS",
+    ) -> None:
         """Send disconnection notification."""
         if not self.notify_connection:
             return
         
         now = datetime.now(self.timezone)
+        mode_line = f"🤖 Mode: <b>{mode}</b>\n" if mode else ""
+        port_line = f"🔌 Port: <code>{port}</code>\n" if port is not None else ""
         msg = (
             "⚠️ <b>DISCONNECTED from Broker</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
             f"📅 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
-            f"📝 {reason}\n"
-            "🔄 Attempting to reconnect..."
+            f"🖥️ Gateway: <b>{gateway_type}</b>\n"
+            f"{mode_line}"
+            f"{port_line}"
+            f"📝 {reason or 'Connection lost'}\n"
+            "🔄 Bot will attempt to reconnect automatically."
         )
         await self.send_message(msg)
     
-    async def notify_reconnected(self) -> None:
+    async def notify_reconnected(self, *, mode: str = "", gateway_type: str = "TWS") -> None:
         """Send reconnection notification."""
         if not self.notify_connection:
             return
         
         now = datetime.now(self.timezone)
+        mode_line = f"🤖 Mode: <b>{mode}</b>\n" if mode else ""
         msg = (
             "✅ <b>RECONNECTED to Broker</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
             f"📅 {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+            f"🖥️ Gateway: <b>{gateway_type}</b>\n"
+            f"{mode_line}"
             "📊 Trading resumed"
         )
         await self.send_message(msg)
@@ -747,6 +865,11 @@ class TelegramNotifier:
     async def shutdown(self) -> None:
         """Clean up resources. Safe to call multiple times."""
         self._stop_pnl_updates()
+
+        if self._background_tasks:
+            pending = list(self._background_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._background_tasks.clear()
 
         if self._session and not self._session.closed:
             try:

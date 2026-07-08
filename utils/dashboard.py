@@ -67,6 +67,8 @@ class TradingDashboard:
         self.st_direction = "NEUTRAL"  # BULL or BEAR
         self.ema_status = "NEUTRAL"  # BULL or BEAR
         self.adx_value = 0.0
+        self.ema_1h: float = 0.0
+        self.close_1h: float = 0.0
         self.current_price = 0.0
         self.last_bar_time: Optional[datetime] = None
         
@@ -98,12 +100,22 @@ class TradingDashboard:
         self,
         st_direction: str,
         ema_status: str,
-        adx_value: float
+        adx_value: float,
+        *,
+        ema_1h: Optional[float] = None,
+        close_1h: Optional[float] = None,
+        signal_bar_time: Optional[datetime] = None,
     ) -> None:
-        """Update indicator values."""
+        """Update indicator values (and optional 1H EMA context for logging/UI)."""
         self.st_direction = st_direction
         self.ema_status = ema_status
         self.adx_value = adx_value
+        if ema_1h is not None and ema_1h == ema_1h:
+            self.ema_1h = float(ema_1h)
+        if close_1h is not None and close_1h == close_1h:
+            self.close_1h = float(close_1h)
+        if signal_bar_time is not None:
+            self.last_bar_time = signal_bar_time
     
     def update_account(
         self,
@@ -209,7 +221,12 @@ class TradingDashboard:
             lines.append(f"  Last Bar: {self.last_bar_time.strftime('%H:%M')}")
         
         lines.append("")
-        lines.append(f"  SuperTrend: {self.st_direction:8}  EMA: {self.ema_status:8}  ADX: {self.adx_value:5.1f}")
+        ema_line = f"  SuperTrend: {self.st_direction:8}  EMA: {self.ema_status:8}  ADX: {self.adx_value:5.1f}"
+        if self.ema_1h > 0:
+            ema_line += f"  |  EMA200(1H): {self.ema_1h:,.2f}"
+        if self.close_1h > 0:
+            ema_line += f"  Close(1H): {self.close_1h:,.2f}"
+        lines.append(ema_line)
         lines.append("")
         
         # Active Position

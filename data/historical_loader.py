@@ -131,46 +131,10 @@ class HistoricalDataLoader:
     def _bars_to_dataframe(self, bars) -> pd.DataFrame:
         """
         Convert IBKR BarData objects to pandas DataFrame.
-        
-        Parameters:
-        -----------
-        bars : list[BarData]
-            List of IBKR BarData objects
-        
-        Returns:
-        --------
-        pd.DataFrame
-            Standardized OHLCV DataFrame
         """
-        data = []
-        for bar in bars:
-            data.append({
-                'datetime': bar.date,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'average': bar.average,
-                'bar_count': bar.barCount
-            })
-        
-        df = pd.DataFrame(data)
-        
-        if len(df) > 0:
-            # Ensure datetime is properly parsed
-            if isinstance(df['datetime'].iloc[0], str):
-                df['datetime'] = pd.to_datetime(df['datetime'])
-            
-            df.set_index('datetime', inplace=True)
-            df.sort_index(inplace=True)
-            
-            # Localize to timezone if needed
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('UTC')
-            df.index = df.index.tz_convert(self.timezone)
-        
-        return df
+        from data.bar_index import bars_to_ohlcv_dataframe
+
+        return bars_to_ohlcv_dataframe(bars, tz=self.timezone)
     
     def save_to_csv(
         self,
@@ -210,30 +174,11 @@ class HistoricalDataLoader:
     def load_from_csv(self, filepath: str) -> pd.DataFrame:
         """
         Load data from CSV cache.
-        
-        Parameters:
-        -----------
-        filepath : str
-            Path to CSV file
-        
-        Returns:
-        --------
-        pd.DataFrame
-            OHLCV data with datetime index
         """
+        from data.bar_index import ensure_datetime_index
+
         df = pd.read_csv(filepath, index_col='datetime')
-        
-        # Convert index to datetime, handling timezone-aware strings
-        try:
-            df.index = pd.to_datetime(df.index, utc=True)
-            # Convert to target timezone
-            df.index = df.index.tz_convert(self.timezone)
-        except Exception:
-            # If that fails, try parsing without utc
-            df.index = pd.to_datetime(df.index)
-            if df.index.tz is None:
-                df.index = df.index.tz_localize(self.timezone)
-        
+        df = ensure_datetime_index(df, tz=self.timezone, datetime_col=None)
         logger.info(f"Loaded {len(df)} bars from {filepath}")
         return df
     

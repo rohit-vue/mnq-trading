@@ -4,8 +4,8 @@
   "entry_time": null,
   "stop_loss": 0.0,
   "take_profit": 0.0,
-  "traded_in_bull_trend": true,
-  "traded_in_bear_trend": true,
+  "traded_in_bull_trend": false,
+  "traded_in_bear_trend": false,
   "prev_st_direction": 1.0,
   "pending_long_ema_wait": false,
   "pending_short_ema_wait": false,
@@ -23,7 +23,7 @@
   "volume_wait_trigger_short": "",
   "volume_wait_kind_long": "",
   "volume_wait_kind_short": "",
-  "trade_count": 3,
-  "daily_trades": 3,
-  "daily_pnl": -203.33800000000338
+  "trade_count": 34,
+  "daily_trades": 34,
+  "daily_pnl": -1731.1270000000004
 }

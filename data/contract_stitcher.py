@@ -57,6 +57,7 @@ def _contract_symbol(root: str, year: int, month: int, month_code: dict) -> str:
 def get_contracts_for_date_range(
     start_date: datetime,
     end_date: datetime,
+    overlap_days: int = 0,
 ) -> List[Tuple[str, datetime, datetime, str]]:
     """
     Determine which MNQ quarterly contracts cover the given date range.
@@ -91,7 +92,8 @@ def get_contracts_for_date_range(
 
             # Check overlap against requested range
             if contract_end >= start_date_naive and contract_start <= end_date_naive:
-                fetch_start = max(contract_start, start_date_naive)
+                overlap_start = contract_start - timedelta(days=max(0, int(overlap_days)))
+                fetch_start = max(overlap_start, start_date_naive)
                 fetch_end = min(contract_end, end_date_naive)
                 symbol = _contract_symbol(root, year, month, month_code)
                 expiry = expiry_label_fn(year, month).strftime("%Y%m%d")
@@ -108,6 +110,7 @@ async def fetch_stitched_data(
     end_date: datetime,
     bar_size: str = "10 mins",
     exchange: str = EXCHANGE,
+    contract_cfg: dict | None = None,
 ) -> pd.DataFrame:
     """
     Fetch historical data from multiple MNQ contracts and stitch together.
@@ -130,8 +133,16 @@ async def fetch_stitched_data(
     """
     from ib_async import Future
     
-    # Get list of contracts needed
-    contracts_needed = get_contracts_for_date_range(start_date, end_date)
+    from data.contract_rollover import assign_contract_per_day, rollover_settings
+
+    # Get list of contracts needed. Include overlap before each new contract's
+    # calendar start so the next month has volume during the current roll window.
+    roll_cfg = rollover_settings(contract_cfg)
+    contracts_needed = get_contracts_for_date_range(
+        start_date,
+        end_date,
+        overlap_days=roll_cfg["roll_window_days"] if roll_cfg["method"] == "volume" else 0,
+    )
     root = CONTRACT_ROOT
     
     if not contracts_needed:
@@ -227,6 +238,7 @@ async def fetch_stitched_data(
             
             contract_df = contract_df[contract_df.index >= fetch_start_tz]
             contract_df = contract_df[contract_df.index <= fetch_end_tz]
+            contract_df["symbol"] = symbol
             
             all_data.append(contract_df)
             logger.info(f"  Total for {symbol}: {len(contract_df)} bars")
@@ -234,47 +246,41 @@ async def fetch_stitched_data(
     # Stitch all contracts together
     if all_data:
         stitched = pd.concat(all_data)
+        stitched = stitched.sort_index()
+
+        # Select one concrete contract per day using the shared volume rollover
+        # rule, then remove any remaining same-timestamp duplicates.
+        assign_df = stitched.reset_index().rename(columns={"datetime": "timestamp"})
+        if "timestamp" not in assign_df.columns:
+            assign_df = assign_df.rename(columns={assign_df.columns[0]: "timestamp"})
+        daily_assignments = assign_contract_per_day(
+            assign_df,
+            contracts_needed,
+            contract_cfg,
+            timestamp_col="timestamp",
+            symbol_col="symbol",
+            volume_col="volume",
+        )
+        stitched["_roll_date"] = [idx.date() for idx in stitched.index]
+        stitched["_front_symbol"] = stitched["_roll_date"].map(daily_assignments)
+        stitched = stitched[stitched["symbol"] == stitched["_front_symbol"]].copy()
+        stitched = stitched.sort_values(["symbol"]).sort_index()
         stitched = stitched[~stitched.index.duplicated(keep='first')]
+        stitched = stitched.drop(columns=["_roll_date", "_front_symbol"], errors="ignore")
         stitched = stitched.sort_index()
         
         logger.info(f"\nStitched data: {len(stitched)} total bars")
         logger.info(f"Date range: {stitched.index[0]} to {stitched.index[-1]}")
-        
-        return stitched
+
+        from data.bar_index import ensure_datetime_index
+
+        return ensure_datetime_index(stitched, tz="US/Eastern", datetime_col=None)
     else:
         return pd.DataFrame()
 
 
 def _bars_to_dataframe(bars) -> pd.DataFrame:
     """Convert IBKR BarData objects to DataFrame."""
-    import pytz
-    
-    data = []
-    for bar in bars:
-        data.append({
-            'datetime': bar.date,
-            'open': bar.open,
-            'high': bar.high,
-            'low': bar.low,
-            'close': bar.close,
-            'volume': bar.volume,
-            'average': bar.average,
-            'bar_count': bar.barCount
-        })
-    
-    df = pd.DataFrame(data)
-    
-    if len(df) > 0:
-        if isinstance(df['datetime'].iloc[0], str):
-            df['datetime'] = pd.to_datetime(df['datetime'])
-        
-        df.set_index('datetime', inplace=True)
-        df.sort_index(inplace=True)
-        
-        # Localize to timezone
-        tz = pytz.timezone('US/Eastern')
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('UTC')
-        df.index = df.index.tz_convert(tz)
-    
-    return df
+    from data.bar_index import bars_to_ohlcv_dataframe
+
+    return bars_to_ohlcv_dataframe(bars, tz="US/Eastern")

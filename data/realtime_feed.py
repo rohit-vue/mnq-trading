@@ -21,6 +21,8 @@ import logging
 import pytz
 from collections import deque
 
+from data.bar_index import bars_to_ohlcv_dataframe, normalize_bar_timestamp
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,11 +82,58 @@ class RealtimeFeed:
         self._last_bar_time: Optional[datetime] = None
         self._last_wall_update: Optional[datetime] = None
         self._bar_update_count: int = 0
-        
+        # Stream health (wall-clock); do not confuse with delayed bar timestamps.
+        self._last_stream_activity_wall: Optional[datetime] = None
+        self._last_emitted_closed_ts: Optional[pd.Timestamp] = None
+        self._last_seen_bar_count: int = 0
+        self._last_restart_wall: Optional[datetime] = None
+        # Active re-fetch (delayed data: keepUpToDate does NOT stream, so we poll).
+        self._last_refetch_wall: Optional[datetime] = None
+        self._max_buffer_bars: int = 8000
+
         # 1H bar tracking for multi-timeframe
         self._1h_bars: deque = deque(maxlen=300)
         self._current_1h_start: Optional[datetime] = None
-        
+
+        # Optional stitched EMA warmup (paper/live near rollover)
+        self._contract_cfg: Optional[Dict[str, Any]] = None
+        self._ema_length: int = 200
+
+    def set_ema_warmup_context(
+        self,
+        contract_cfg: Optional[Dict[str, Any]],
+        ema_length: int = 200,
+    ) -> None:
+        """Enable volume-stitched EMA preload when near quarterly rollover."""
+        self._contract_cfg = contract_cfg
+        self._ema_length = int(ema_length)
+
+    def preload_bars(self, bars: List) -> None:
+        """Merge historical bars into the buffer (e.g. stitched EMA warmup)."""
+        if not bars:
+            return
+        if self._bars:
+            self._merge_bars(bars)
+        else:
+            self._bars = list(bars)
+            if len(self._bars) > self._max_buffer_bars:
+                self._bars = self._bars[-self._max_buffer_bars :]
+        self._build_dataframe()
+
+    async def _maybe_preload_stitched_ema_warmup(self) -> None:
+        if self._contract_cfg is None:
+            return
+        from data.feed_warmup import preload_stitched_ema_warmup
+
+        await preload_stitched_ema_warmup(
+            self,
+            ib=self.ib,
+            contract=self.contract,
+            contract_cfg=self._contract_cfg,
+            ema_length=self._ema_length,
+            bar_size=self.bar_size,
+        )
+
     async def start(self, initial_lookback_days: int = 10) -> None:
         """
         Start the real-time data feed.
@@ -112,6 +161,9 @@ class RealtimeFeed:
 
         logger.info(f"Starting real-time feed for {self.contract.symbol}")
 
+        # Near rollover: preload volume-stitched history so EMA200 matches backtest.
+        await self._maybe_preload_stitched_ema_warmup()
+
         # Subscribe with keepUpToDate
         self._subscription = await self.ib.reqHistoricalDataAsync(
             contract=self.contract,
@@ -127,22 +179,51 @@ class RealtimeFeed:
         # Register update handler
         self._subscription.updateEvent += self._on_bar_update
 
-        # Store initial bars
-        self._bars = list(self._subscription)
+        # Merge fresh bars into the existing buffer so a restart/reconnect does NOT
+        # discard the long history needed to warm the 1H EMA200. A restart re-fetches
+        # only a few days; replacing the buffer would shrink it and distort the EMA.
+        # On the first start the buffer is empty, so this just stores the fetched bars.
+        fresh_bars = list(self._subscription)
+        if self._bars:
+            prev_len = len(self._bars)
+            self._merge_bars(fresh_bars)
+            logger.info(
+                "Feed restart merged %s fetched bars into buffer (%s -> %s bars, history preserved)",
+                len(fresh_bars),
+                prev_len,
+                len(self._bars),
+            )
+        else:
+            self._bars = fresh_bars
         self._build_dataframe()
 
         self._is_running = True
-        self._last_wall_update = datetime.now(self.timezone)
+        now = datetime.now(self.timezone)
+        self._last_wall_update = now
+        self._touch_stream_activity(now)
+        self._last_seen_bar_count = len(self._bars)
+        first_init = self._last_emitted_closed_ts is None
         if self._bars:
-            self._last_bar_time = pd.Timestamp(self._bars[-1].date)
-            if self._last_bar_time.tzinfo is None:
-                self._last_bar_time = self._last_bar_time.tz_localize('UTC')
-            self._last_bar_time = self._last_bar_time.tz_convert(self.timezone)
-        logger.info(f"Real-time feed started with {len(self._bars)} initial bars")
+            self._last_bar_time = self._normalize_bar_ts(self._bars[-1].date)
+            if len(self._bars) >= 2:
+                latest_closed = self._bars[-2]
+                closed_ts = self._normalize_bar_ts(latest_closed.date)
+                if first_init:
+                    # First start: do not re-fire strategy on historical bars.
+                    self._last_emitted_closed_ts = closed_ts
+                elif closed_ts > self._last_emitted_closed_ts:
+                    # Restart/reconnect: a new bar formed during the gap — process it.
+                    self._process_closed_bar(latest_closed, source="restart")
+        logger.info(
+            "Real-time feed started with %s initial bars (last closed=%s)",
+            len(self._bars),
+            self._last_emitted_closed_ts,
+        )
         
     async def restart(self, initial_lookback_days: int = 10) -> None:
         """Stop and resubscribe to historical streaming bars (recover from stale feed)."""
         logger.info("Restarting real-time feed subscription...")
+        self.mark_restarted()
         await self.stop()
         await self.start(initial_lookback_days=initial_lookback_days)
         
@@ -155,6 +236,169 @@ class RealtimeFeed:
             self._subscription = None
             
         logger.info("Real-time feed stopped")
+
+    def _normalize_bar_ts(self, bar_date) -> pd.Timestamp:
+        return normalize_bar_timestamp(bar_date, self.timezone)
+
+    def _touch_stream_activity(self, when: Optional[datetime] = None) -> None:
+        self._last_stream_activity_wall = when or datetime.now(self.timezone)
+
+    def _process_closed_bar(self, closed_bar, *, source: str) -> None:
+        """Run bar-close callbacks once per completed primary bar."""
+        closed_ts = self._normalize_bar_ts(closed_bar.date)
+        if (
+            self._last_emitted_closed_ts is not None
+            and closed_ts <= self._last_emitted_closed_ts
+        ):
+            return
+
+        self._last_emitted_closed_ts = closed_ts
+        self._touch_stream_activity()
+        logger.info(
+            "Bar closed (%s): %s | O=%.2f H=%.2f L=%.2f C=%.2f | bars=%s",
+            source,
+            closed_bar.date,
+            closed_bar.open,
+            closed_bar.high,
+            closed_bar.low,
+            closed_bar.close,
+            len(self._bars),
+        )
+        self._emit_bar_close(closed_bar)
+
+    def _merge_bars(self, new_bars) -> bool:
+        """
+        Merge freshly fetched bars into the existing buffer (keyed by timestamp).
+
+        Preserves the long history needed for EMA200/indicator warmup while adding
+        newly completed bars. Returns True if a new bar timestamp appeared.
+        """
+        if not new_bars:
+            return False
+        by_ts: Dict[pd.Timestamp, Any] = {}
+        for b in self._bars:
+            by_ts[self._normalize_bar_ts(b.date)] = b
+        last_before = max(by_ts) if by_ts else None
+
+        for b in new_bars:
+            by_ts[self._normalize_bar_ts(b.date)] = b
+
+        merged = [by_ts[k] for k in sorted(by_ts)]
+        if len(merged) > self._max_buffer_bars:
+            merged = merged[-self._max_buffer_bars:]
+        self._bars = merged
+
+        last_after = self._normalize_bar_ts(merged[-1].date) if merged else None
+        if last_before is None:
+            return True
+        return last_after is not None and last_after > last_before
+
+    async def poll_refetch_and_emit(
+        self,
+        lookback_days: int = 1,
+        min_interval_sec: float = 45.0,
+        only_when_market_open: bool = True,
+    ) -> int:
+        """
+        Re-fetch recent historical bars and emit any newly completed bar.
+
+        Required for delayed market data, where reqHistoricalData(keepUpToDate=True)
+        does NOT stream live updates. A throttled one-shot historical request fetches
+        recent bars, merges them, and fires the strategy bar-close callback once per
+        new completed bar (deduped via the emit pointer).
+        """
+        if not self._is_running:
+            return 0
+        if only_when_market_open and not self.is_market_hours(check_rth=False):
+            return 0
+
+        now = datetime.now(self.timezone)
+        if (
+            self._last_refetch_wall is not None
+            and (now - self._last_refetch_wall).total_seconds() < min_interval_sec
+        ):
+            return 0
+        self._last_refetch_wall = now
+
+        try:
+            new_bars = await self.ib.reqHistoricalDataAsync(
+                contract=self.contract,
+                endDateTime='',
+                durationStr=f"{lookback_days} D",
+                barSizeSetting=self.bar_size,
+                whatToShow='TRADES',
+                useRTH=False,
+                formatDate=2,
+                keepUpToDate=False,
+            )
+        except Exception as e:
+            logger.debug("Poll refetch failed: %s", e)
+            return 0
+
+        if not new_bars:
+            return 0
+
+        advanced = self._merge_bars(new_bars)
+        if not advanced:
+            return 0
+
+        self._build_dataframe()
+        if self._bars:
+            self._last_bar_time = self._normalize_bar_ts(self._bars[-1].date)
+        self._touch_stream_activity(now)
+        self._last_seen_bar_count = len(self._bars)
+
+        emitted = 0
+        if len(self._bars) >= 2:
+            latest_closed = self._bars[-2]
+            closed_ts = self._normalize_bar_ts(latest_closed.date)
+            if (
+                self._last_emitted_closed_ts is None
+                or closed_ts > self._last_emitted_closed_ts
+            ):
+                self._process_closed_bar(latest_closed, source="refetch")
+                emitted = 1
+        return emitted
+
+    def minutes_since_stream_activity(self) -> Optional[float]:
+        """Wall-clock minutes since last IB callback or detected bar advance."""
+        if self._last_stream_activity_wall is None:
+            return None
+        now = datetime.now(self.timezone)
+        return (now - self._last_stream_activity_wall).total_seconds() / 60.0
+
+    def minutes_since_last_closed_bar(self) -> Optional[float]:
+        """Minutes since the last completed bar timestamp (lags with delayed data)."""
+        closed = self.get_latest_closed_bar()
+        if not closed:
+            return None
+        ts = closed["datetime"]
+        if hasattr(ts, "to_pydatetime"):
+            ts = ts.to_pydatetime()
+        if getattr(ts, "tzinfo", None) is None:
+            ts = self.timezone.localize(ts)
+        now = datetime.now(self.timezone)
+        return (now - ts).total_seconds() / 60.0
+
+    def is_stream_stale(self, max_idle_minutes: float) -> bool:
+        """
+        True when the IB stream has had no callbacks and no bar advances
+        for max_idle_minutes. Uses wall-clock idle time, not bar timestamp lag
+        (delayed quotes are always ~15 min behind and must not trigger restart).
+        """
+        idle = self.minutes_since_stream_activity()
+        if idle is None:
+            return False
+        return idle >= max_idle_minutes
+
+    def can_restart(self, cooldown_minutes: float = 5.0) -> bool:
+        if self._last_restart_wall is None:
+            return True
+        elapsed = (datetime.now(self.timezone) - self._last_restart_wall).total_seconds() / 60.0
+        return elapsed >= cooldown_minutes
+
+    def mark_restarted(self) -> None:
+        self._last_restart_wall = datetime.now(self.timezone)
     
     def _on_bar_update(self, bars, has_new_bar: bool) -> None:
         """
@@ -171,35 +415,26 @@ class RealtimeFeed:
             return
 
         self._last_wall_update = datetime.now(self.timezone)
+        self._touch_stream_activity()
         self._bar_update_count += 1
         current_bar = bars[-1]
-        bar_ts = pd.Timestamp(current_bar.date)
-        if bar_ts.tzinfo is None:
-            bar_ts = bar_ts.tz_localize('UTC')
-        self._last_bar_time = bar_ts.tz_convert(self.timezone)
-        
+        self._last_bar_time = self._normalize_bar_ts(current_bar.date)
+        prev_count = len(self._bars)
+        new_bar_added = has_new_bar or len(bars) > prev_count
+
         # Check if new bar added (previous bar closed)
-        if has_new_bar:
-            # A new bar means the previous bar is now CONFIRMED/CLOSED
-            # This is when we should execute signals
-            self._bars = list(bars)
+        if new_bar_added:
+            # A new bar means the previous bar is now CONFIRMED/CLOSED.
+            # Merge (don't replace) so streamed bars never shrink the buffer below
+            # the history needed to warm the 1H EMA200.
+            self._merge_bars(list(bars))
             self._build_dataframe()
-            
-            # Notify bar close callbacks
+            self._last_seen_bar_count = len(self._bars)
+
             closed_bar = bars[-2] if len(bars) >= 2 else None
             if closed_bar:
-                logger.info(
-                    "Bar closed: %s | O=%.2f H=%.2f L=%.2f C=%.2f | bars=%s",
-                    closed_bar.date,
-                    closed_bar.open,
-                    closed_bar.high,
-                    closed_bar.low,
-                    closed_bar.close,
-                    len(bars),
-                )
-                self._emit_bar_close(closed_bar)
-            
-            # Check for 1H bar close
+                self._process_closed_bar(closed_bar, source="stream")
+
             self._check_1h_bar_close(current_bar)
         else:
             # Intrabar update - just update the last bar
@@ -267,33 +502,7 @@ class RealtimeFeed:
         if not self._bars:
             self._df = pd.DataFrame()
             return
-        
-        data = []
-        for bar in self._bars:
-            data.append({
-                'datetime': bar.date,
-                'open': bar.open,
-                'high': bar.high,
-                'low': bar.low,
-                'close': bar.close,
-                'volume': bar.volume,
-                'average': bar.average,
-                'bar_count': bar.barCount
-            })
-        
-        df = pd.DataFrame(data)
-        
-        if isinstance(df['datetime'].iloc[0], str):
-            df['datetime'] = pd.to_datetime(df['datetime'])
-        
-        df.set_index('datetime', inplace=True)
-        df.sort_index(inplace=True)
-        
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('UTC')
-        df.index = df.index.tz_convert(self.timezone)
-        
-        self._df = df
+        self._df = bars_to_ohlcv_dataframe(self._bars, tz=self.timezone)
     
     def _update_last_bar(self, bar) -> None:
         """Update just the last bar in the DataFrame (for intrabar updates)."""

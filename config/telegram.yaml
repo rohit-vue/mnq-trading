@@ -30,5 +30,7 @@ notifications:
   market_status_interval_seconds: 3600  # 1 hour
   # Alert when SuperTrend flips on a completed primary bar
   supertrend_flip: true
+  # Alert when futures contract rolls to the next active month
+  contract_roll: true
   connection_status: true
   errors: true

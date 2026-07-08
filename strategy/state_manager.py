@@ -634,8 +634,28 @@ class StateManager:
                 logger.info(f"State loaded: position={self.state.position_size}, "
                           f"bull_traded={self.state.traded_in_bull_trend}, "
                           f"bear_traded={self.state.traded_in_bear_trend}")
+                self.repair_flat_dual_trade_flags()
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")
+
+    def repair_flat_dual_trade_flags(self) -> None:
+        """
+        Reset impossible flat state where both trend trade flags are set.
+
+        Can happen after a stale feed missed SuperTrend flip processing.
+        """
+        if (
+            self.state.position_size == 0
+            and self.state.traded_in_bull_trend
+            and self.state.traded_in_bear_trend
+        ):
+            logger.warning(
+                "Both traded_in_bull_trend and traded_in_bear_trend are true while "
+                "flat — resetting flags (likely missed ST flip from stale feed)"
+            )
+            self.state.traded_in_bull_trend = False
+            self.state.traded_in_bear_trend = False
+            self.save_state()
     
     def get_state_summary(self) -> Dict[str, Any]:
         """Get current state summary for display."""

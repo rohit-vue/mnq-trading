@@ -81,6 +81,7 @@ async def main():
         end_date=end_date,
         symbol_filter="MNQ",
         data_dir=DATABENTO_DIR,
+        contract_cfg=contract_cfg,
         primary_resample_rule=primary_resample,
         strategy_cfg=strategy_cfg,
         ema_length=ema_cfg.get('length', 200),

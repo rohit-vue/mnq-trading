@@ -19,6 +19,8 @@ import numpy as np
 import pandas as pd
 from typing import Union, Optional
 
+from data.bar_index import ensure_datetime_index
+
 
 def filter_rth_hours(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -40,15 +42,7 @@ def filter_rth_hours(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) == 0:
         return df
     
-    # Work with a copy to avoid modifying original
-    df_copy = df.copy()
-    
-    # Ensure index is timezone-aware (assume US/Eastern if naive)
-    if df_copy.index.tz is None:
-        # Assume US/Eastern if timezone-naive
-        df_copy.index = df_copy.index.tz_localize('US/Eastern')
-    else:
-        df_copy.index = df_copy.index.tz_convert('US/Eastern')
+    df_copy = ensure_datetime_index(df, tz='US/Eastern', datetime_col=None)
     
     # Filter to RTH: 9:30 AM - 4:00 PM ET, weekdays only
     rth_mask = (
@@ -62,7 +56,7 @@ def filter_rth_hours(df: pd.DataFrame) -> pd.DataFrame:
     filtered_df = df_copy.loc[rth_mask].copy()
     
     # Convert index back to timezone-naive if original was naive
-    if df.index.tz is None:
+    if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
         filtered_df.index = filtered_df.index.tz_localize(None)
     
     return filtered_df

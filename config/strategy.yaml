@@ -70,7 +70,7 @@ long_risk:
 
 short_risk:
   stop_loss_pct: 0.35
-  take_profit_pct: 4
+  take_profit_pct: 2
 
 # Legacy (optional): used when long_risk / short_risk are missing
 risk:
@@ -84,14 +84,14 @@ risk:
 # Set use_adx: false to backtest without ADX (supporting indicator) for comparison
 # -----------------------------------------------------------------------------
 long_adx:
-  use_adx: true
+  use_adx: false
   di_length: 14
   adx_smoothing: 14
   threshold: 24
   consecutive_candles: 5
 
 short_adx:
-  use_adx: true
+  use_adx: false
   di_length: 14
   adx_smoothing: 14
   threshold: 24
@@ -99,7 +99,7 @@ short_adx:
 
 # Legacy (optional): used when long_adx / short_adx are missing
 adx:
-  use_adx: true
+  use_adx: false
   di_length: 14
   adx_smoothing: 14
   threshold: 24
@@ -122,7 +122,7 @@ execution:
   pyramiding: 0                       # Max concurrent positions (0 = no stacking)
   process_orders_on_close: true       # Execute signals at bar close only
   initial_capital: 100000             # Starting capital for backtesting
-  independent_books: true             # Backtest long/short in isolated books, then merge
+  independent_books: false             # Backtest long/short in isolated books, then merge
 
 # -----------------------------------------------------------------------------
 # BAR CLOSE LOGIC

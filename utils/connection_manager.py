@@ -112,6 +112,7 @@ class ConnectionManager:
         self._shutdown_requested = False
         self._last_connected_time: Optional[datetime] = None
         self._total_reconnects = 0
+        self._disconnect_alert_sent = False
 
         # Error 1100/1102 state tracking
         self._connectivity_lost = False  # True while in 1100 state
@@ -168,6 +169,24 @@ class ConnectionManager:
             logger.error(f"Connection failed: {e}")
             return False
     
+    def _reset_disconnect_alert(self) -> None:
+        """Allow a new disconnect Telegram alert after a successful recovery."""
+        self._disconnect_alert_sent = False
+        self._connectivity_lost = False
+        self._last_1100_time = None
+        self._1100_count = 0
+
+    def _notify_disconnect_listeners(self) -> None:
+        """Fire disconnect callback once per outage (deduped)."""
+        if self._shutdown_requested or self._disconnect_alert_sent:
+            return
+        self._disconnect_alert_sent = True
+        if self._on_disconnect_callback:
+            try:
+                self._on_disconnect_callback()
+            except Exception as e:
+                logger.error(f"Error in disconnect callback: {e}")
+
     def _on_disconnect(self) -> None:
         """Handle disconnect event."""
         if self._shutdown_requested:
@@ -179,14 +198,10 @@ class ConnectionManager:
         # Stop health monitor
         self._stop_health_monitor()
         
-        if self._on_disconnect_callback:
-            try:
-                self._on_disconnect_callback()
-            except Exception as e:
-                logger.error(f"Error in disconnect callback: {e}")
+        self._notify_disconnect_listeners()
         
-        # Start reconnection if running
-        if self._is_running and not self._reconnect_task:
+        # Start reconnection if running and socket is actually down
+        if self._is_running and not self._reconnect_task and not self.ib.isConnected():
             self._reconnect_task = asyncio.create_task(self._reconnect_loop())
     
     def _on_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
@@ -207,6 +222,8 @@ class ConnectionManager:
                 self._last_1100_time = datetime.now()
                 self._1100_count = 0
                 logger.warning(f"Connection error {errorCode}: {errorString}")
+                # 1100 does NOT fire disconnectedEvent — alert user immediately
+                self._notify_disconnect_listeners()
             else:
                 self._1100_count += 1
                 # Log a summary every 20 occurrences instead of every time
@@ -227,10 +244,7 @@ class ConnectionManager:
                 f"(was down for {elapsed:.0f}s, {self._1100_count} error events)"
             )
 
-            # Reset connectivity loss state
-            self._connectivity_lost = False
-            self._last_1100_time = None
-            self._1100_count = 0
+            self._reset_disconnect_alert()
             self._current_delay = self.config.initial_delay
 
             # CRITICAL: Trigger reconnect callback to restart feed and resync
@@ -323,6 +337,7 @@ class ConnectionManager:
 
                 self._total_reconnects += 1
                 self._last_connected_time = datetime.now()
+                self._reset_disconnect_alert()
 
                 logger.info(
                     f"Reconnected successfully after {self._reconnect_count} attempts "
@@ -394,11 +409,7 @@ class ConnectionManager:
                     logger.warning("Health check: Connection lost (silent disconnect)")
                     # Trigger reconnection
                     if not self._reconnect_task:
-                        if self._on_disconnect_callback:
-                            try:
-                                self._on_disconnect_callback()
-                            except Exception as e:
-                                logger.error(f"Error in disconnect callback: {e}")
+                        self._notify_disconnect_listeners()
                         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
                     break
                     

@@ -18,7 +18,7 @@ connection:
   default_gateway: "tws"       # Options: "tws", "gateway" (use "gateway" for 24/7 via IB Gateway)
   
   # Client ID (ensure unique across all connected apps)
-  client_id: 1
+  client_id: 2
 
 # -----------------------------------------------------------------------------
 # DATA SUBSCRIPTION SETTINGS

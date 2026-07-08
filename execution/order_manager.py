@@ -116,6 +116,7 @@ class OrderManager:
         self.pending_orders: Dict[int, OrderTicket] = {}
         self.filled_orders: Dict[int, OrderTicket] = {}
         self.cancelled_orders: Dict[int, OrderTicket] = {}
+        self.execution_prices: Dict[int, float] = {}
         
         # Active bracket
         self.active_bracket: Optional[BracketTickets] = None
@@ -186,6 +187,61 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Failed to place market order: {e}")
             return None
+
+    async def wait_for_fill_price(
+        self,
+        trade: Optional[IBTrade],
+        timeout_seconds: float = 5.0,
+    ) -> Optional[float]:
+        """Wait briefly for IBKR to report the actual fill price for a trade."""
+        if trade is None:
+            return None
+
+        order_id = getattr(trade.order, "orderId", None)
+        deadline = datetime.now(self.timezone).timestamp() + timeout_seconds
+
+        while datetime.now(self.timezone).timestamp() < deadline:
+            fill_price = self.get_fill_price(trade)
+            if fill_price is not None:
+                return fill_price
+            await asyncio.sleep(0.1)
+
+        return self.get_fill_price(trade)
+
+    def get_fill_price(self, trade: Optional[IBTrade]) -> Optional[float]:
+        """Return the best known actual fill price for a trade."""
+        if trade is None:
+            return None
+
+        order_id = getattr(trade.order, "orderId", None)
+        if order_id in self.execution_prices:
+            return self.execution_prices[order_id]
+
+        fills = getattr(trade, "fills", None) or []
+        if fills:
+            prices = []
+            quantities = []
+            for fill in fills:
+                execution = getattr(fill, "execution", None)
+                if execution is None:
+                    continue
+                price = float(getattr(execution, "avgPrice", 0) or getattr(execution, "price", 0) or 0)
+                qty = float(getattr(execution, "shares", 0) or 0)
+                if price > 0 and qty > 0:
+                    prices.append(price)
+                    quantities.append(qty)
+            if prices and quantities:
+                total_qty = sum(quantities)
+                if total_qty > 0:
+                    return sum(price * qty for price, qty in zip(prices, quantities)) / total_qty
+
+        order_status = getattr(trade, "orderStatus", None)
+        avg_fill = float(getattr(order_status, "avgFillPrice", 0) or 0)
+        filled = float(getattr(order_status, "filled", 0) or 0)
+        if avg_fill > 0 and filled > 0:
+            return avg_fill
+
+        return None
     
     async def place_bracket_order(
         self,
@@ -469,6 +525,10 @@ class OrderManager:
     
     def _on_execution(self, trade: IBTrade, fill) -> None:
         """Handle execution reports."""
+        order_id = getattr(fill.execution, "orderId", None)
+        fill_price = float(getattr(fill.execution, "avgPrice", 0) or getattr(fill.execution, "price", 0) or 0)
+        if order_id is not None and fill_price > 0:
+            self.execution_prices[order_id] = fill_price
         logger.info(f"Execution: {fill.contract.symbol} {fill.execution.side} "
                    f"{fill.execution.shares} @ {fill.execution.avgPrice:.2f}")
     

@@ -475,18 +475,49 @@ class SignalEngine:
         _close_1h_cross_raw = bar.get('close_1h_cross', np.nan)
         close_1h_cross = _close_1h_cross_raw if (not np.isnan(_close_1h_cross_raw)) else close
         
-        # For partial cross detection at hour boundaries:
-        # - is_new_1h_candle: True on the first 10m bar of each new hour
+        # Confirmed 1H values available to the current primary bar:
         # - _close_confirmed / _ema_confirmed: confirmed (non-lookahead) 1H values
         #   Backtest uses close_1h_cross / ema_1h_cross (shifted +1H);
         #   Paper/live falls back to close_1h / ema_1h (already confirmed there).
-        is_new_1h_candle = bar.get('is_new_1h_candle', False)
         _ema_1h_cross_raw = bar.get('ema_1h_cross', np.nan)
         _close_confirmed = _close_1h_cross_raw if not np.isnan(_close_1h_cross_raw) else close_1h
         _ema_confirmed = _ema_1h_cross_raw if not np.isnan(_ema_1h_cross_raw) else ema_1h
         
         ema_bull_cross = bar.get('ema_bull_cross', False)
         ema_bear_cross = bar.get('ema_bear_cross', False)
+        try:
+            primary_bar_minutes = float(bar.get('primary_bar_minutes', 5) or 5)
+        except (TypeError, ValueError):
+            primary_bar_minutes = 5
+        if primary_bar_minutes <= 0:
+            primary_bar_minutes = 5
+        timestamp_hour_close = (
+            isinstance(timestamp, pd.Timestamp)
+            and (
+                timestamp + pd.Timedelta(minutes=primary_bar_minutes)
+            ).floor("h") != timestamp.floor("h")
+        )
+        is_1h_close_bar = bool(bar.get('is_1h_close_bar', False) or timestamp_hour_close)
+        current_hour_bull_cross = (
+            is_1h_close_bar
+            and not pd.isna(close_1h)
+            and not pd.isna(ema_1h)
+            and not pd.isna(_close_confirmed)
+            and not pd.isna(_ema_confirmed)
+            and close_1h > ema_1h
+            and _close_confirmed <= _ema_confirmed
+        )
+        current_hour_bear_cross = (
+            is_1h_close_bar
+            and not pd.isna(close_1h)
+            and not pd.isna(ema_1h)
+            and not pd.isna(_close_confirmed)
+            and not pd.isna(_ema_confirmed)
+            and close_1h < ema_1h
+            and _close_confirmed >= _ema_confirmed
+        )
+        ema_bull_cross_now = bool(ema_bull_cross or current_hour_bull_cross)
+        ema_bear_cross_now = bool(ema_bear_cross or current_hour_bear_cross)
         
         adx_value = float(bar.get('adx', bar.get('adx_long', 0)) or 0)
         adx_above_long = bar.get('adx_above_threshold_long', bar.get('adx_above_threshold', False))
@@ -753,32 +784,25 @@ class SignalEngine:
         
         # =================================================================
         # 5) PENDING BULLISH EMA CROSS — Deferred Entry
-        #    Fires when: pending wait active, ST still bullish,
-        #    1H Close crossed above EMA200.
-        #    Also catches "partial cross" from the ST flip hour where
-        #    Low <= EMA but Close > EMA (confirmed at the next hour boundary).
+        #    Fires only when the backtest-style ema_bull_cross flag is true:
+        #    previous confirmed 1H close <= EMA and newly confirmed 1H close > EMA.
         #    Two outcomes:
         #    a) ADX ok -> enter BUY
         #    b) ADX low -> start 5-bar ADX wait, clear EMA wait
         # =================================================================
-        # Partial cross: at the first bar of a new hour, the confirmed 1H
-        # close is already above EMA (no transition needed).
-        confirmed_above_ema = (
-            is_new_1h_candle and
-            not pd.isna(_close_confirmed) and
-            not pd.isna(_ema_confirmed) and
-            _close_confirmed > _ema_confirmed
-        )
         if (pending_long_ema_wait and st_bull_l and
                 not traded_in_bull_trend and
-                (ema_bull_cross or confirmed_above_ema)):
+                ema_bull_cross_now):
             adx_ok = (not self.use_adx_long) or adx_above_long
             thr = self.adx_threshold_long
             if adx_ok:
+                entry_price = close_1h if current_hour_bull_cross else close_1h_cross
+                entry_close_1h = close_1h if current_hour_bull_cross else _close_confirmed
+                entry_ema_1h = ema_1h if current_hour_bull_cross else _ema_confirmed
                 signal = Signal(
                     signal_type=SignalType.BUY,
                     timestamp=timestamp,
-                    price=close_1h_cross,
+                    price=entry_price,
                     supertrend_value=supertrend_value,
                     supertrend_direction=supertrend_dir,
                     ema_1h=ema_1h,
@@ -790,7 +814,7 @@ class SignalEngine:
                 adx_str = f", ADX({adx_value:.1f}) >= {thr:g} ✓" if self.use_adx_long else ""
                 logger.info(
                     f"[CONFIRMED] {timestamp_str} | EMA Cross BUY: "
-                    f"1H Close crossed > EMA({ema_1h:.2f}) ✓, ST=BULL ✓"
+                    f"1H Close({entry_close_1h:.2f}) crossed > EMA({entry_ema_1h:.2f}) ✓, ST=BULL ✓"
                     f"{adx_str}"
                 )
                 return self._finalize_entry_volume(
@@ -814,32 +838,25 @@ class SignalEngine:
         
         # =================================================================
         # 6) PENDING BEARISH EMA CROSS — Deferred Entry
-        #    Fires when: pending wait active, ST still bearish,
-        #    1H Close crossed below EMA200.
-        #    Also catches "partial cross" from the ST flip hour where
-        #    High >= EMA but Close < EMA (confirmed at the next hour boundary).
+        #    Fires only when the backtest-style ema_bear_cross flag is true:
+        #    previous confirmed 1H close >= EMA and newly confirmed 1H close < EMA.
         #    Two outcomes:
         #    a) ADX ok -> enter SELL
         #    b) ADX low -> start 5-bar ADX wait, clear EMA wait
         # =================================================================
-        # Partial cross: at the first bar of a new hour, the confirmed 1H
-        # close is already below EMA (no transition needed).
-        confirmed_below_ema = (
-            is_new_1h_candle and
-            not pd.isna(_close_confirmed) and
-            not pd.isna(_ema_confirmed) and
-            _close_confirmed < _ema_confirmed
-        )
         if (pending_short_ema_wait and st_bear_s and
                 not traded_in_bear_trend and
-                (ema_bear_cross or confirmed_below_ema)):
+                ema_bear_cross_now):
             adx_ok = (not self.use_adx_short) or adx_above_short
             thr_s = self.adx_threshold_short
             if adx_ok:
+                entry_price = close_1h if current_hour_bear_cross else close_1h_cross
+                entry_close_1h = close_1h if current_hour_bear_cross else _close_confirmed
+                entry_ema_1h = ema_1h if current_hour_bear_cross else _ema_confirmed
                 signal = Signal(
                     signal_type=SignalType.SELL,
                     timestamp=timestamp,
-                    price=close_1h_cross,
+                    price=entry_price,
                     supertrend_value=su_s,
                     supertrend_direction=dir_s,
                     ema_1h=ema_1h,
@@ -851,7 +868,7 @@ class SignalEngine:
                 adx_str = f", ADX({adx_value:.1f}) >= {thr_s:g} ✓" if self.use_adx_short else ""
                 logger.info(
                     f"[CONFIRMED] {timestamp_str} | EMA Cross SELL: "
-                    f"1H Close crossed < EMA({ema_1h:.2f}) ✓, ST=BEAR ✓"
+                    f"1H Close({entry_close_1h:.2f}) crossed < EMA({entry_ema_1h:.2f}) ✓, ST=BEAR ✓"
                     f"{adx_str}"
                 )
                 return self._finalize_entry_volume(

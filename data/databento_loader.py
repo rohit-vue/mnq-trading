@@ -97,6 +97,7 @@ def load_databento_data(
     symbol_filter: str = "MNQ",
     data_dir: str = DATABENTO_DIR,
     contract_root: Optional[str] = None,
+    contract_cfg: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Load Databento CSV files and combine into single DataFrame.
@@ -192,31 +193,23 @@ def load_databento_data(
         logger.warning(f"Filtered out {filtered_count} rows with invalid price data")
     
     # === CREATE STITCHED CONTINUOUS CONTRACT ===
-    # Use same contract boundary generation as IBKR stitcher.
-    print("\n[INFO] Creating stitched continuous contract (CME expiry boundaries)...")
+    # Use volume-based rollover assignment to match the most liquid outright
+    # contract while retaining concrete contract labels for rollover exits.
+    print("\n[INFO] Creating stitched continuous contract (volume rollover)...")
     from data.contract_stitcher import get_contracts_for_date_range
+    from data.contract_rollover import assign_contract_per_day
     contracts_for_range = get_contracts_for_date_range(start_date, end_date)
-    
-    def get_front_month_contract(timestamp):
-        """Get the front-month contract for a given timestamp.
-        On dates where contracts overlap, the FIRST matching contract wins.
-        This matches IBKR behavior where the old contract is preferred until its end date/time.
-        Special handling for Dec 15, 2025: MNQZ5 ends at 21:58:59, MNQH6 starts at 21:59:00.
-        """
-        ts = pd.Timestamp(timestamp)
-        
-        for contract, start_ts, end_ts, _expiry in contracts_for_range:
-            # Check if timestamp falls within this contract's range (inclusive)
-            if start_ts <= ts <= end_ts:
-                return contract
-        
-        return None
-    
-    # Add front_month column based on rollover schedule
-    combined_df['front_month'] = combined_df['timestamp'].apply(get_front_month_contract)
-    
-    # Filter to only keep rows where symbol matches the front month contract
-    # This ensures we use the same contract at each point in time as IBKR
+
+    daily_assignments = assign_contract_per_day(
+        combined_df,
+        contracts_for_range,
+        contract_cfg,
+        timestamp_col="timestamp",
+        symbol_col="symbol",
+        volume_col="volume",
+    )
+    combined_df['_roll_date'] = combined_df['timestamp'].apply(lambda ts: pd.Timestamp(ts).date())
+    combined_df['front_month'] = combined_df['_roll_date'].map(daily_assignments)
     combined_df = combined_df[combined_df['symbol'] == combined_df['front_month']].copy()
     
     if len(combined_df) == 0:
@@ -234,7 +227,16 @@ def load_databento_data(
             (combined_df['open'] >= min_price) &
             (combined_df['open'] <= max_price)
         ]
-        combined_df['front_month'] = combined_df['timestamp'].apply(get_front_month_contract)
+        daily_assignments = assign_contract_per_day(
+            combined_df,
+            contracts_for_range,
+            contract_cfg,
+            timestamp_col="timestamp",
+            symbol_col="symbol",
+            volume_col="volume",
+        )
+        combined_df['_roll_date'] = combined_df['timestamp'].apply(lambda ts: pd.Timestamp(ts).date())
+        combined_df['front_month'] = combined_df['_roll_date'].map(daily_assignments)
         # Match by prefix (MNQH5 matches MNQH5)
         combined_df = combined_df[combined_df.apply(
             lambda row: row['symbol'].startswith(row['front_month'][:4]) if row['front_month'] else False, 
@@ -254,7 +256,7 @@ def load_databento_data(
         print(f"[INFO] Resolved {duplicates_before} timestamp duplicates using volume-based selection")
     
     # Clean up helper column
-    combined_df = combined_df.drop(columns=['front_month'], errors='ignore')
+    combined_df = combined_df.drop(columns=['front_month', '_roll_date'], errors='ignore')
     
     combined_df.set_index('timestamp', inplace=True)
     combined_df.sort_index(inplace=True)
@@ -329,6 +331,7 @@ def prepare_databento_for_backtest(
     symbol_filter: str = "MNQ",
     data_dir: str = DATABENTO_DIR,
     contract_root: Optional[str] = None,
+    contract_cfg: Optional[dict] = None,
     # Primary timeframe (from strategy timeframes.primary, e.g. "10min", "15min")
     primary_resample_rule: str = "10min",
     # Strategy parameters (from config)
@@ -410,6 +413,7 @@ def prepare_databento_for_backtest(
         symbol_filter=symbol_filter,
         data_dir=data_dir,
         contract_root=contract_root,
+        contract_cfg=contract_cfg,
     )
     
     # Resample to primary timeframe (e.g. 10m, 15m)
