@@ -86,33 +86,54 @@ async def ensure_market_data(ib, contract: Any, ibkr_cfg: dict) -> Any:
     """
     Subscribe to MNQ quotes so keepUpToDate bars stream and IBKR allows orders (avoids Error 354).
 
-    Requires delayed data enabled in TWS/Gateway if you do not have a live CME subscription.
+    Prefers LIVE (type 1). Falls back to delayed types only when accept_delayed is true
+    and live ticks do not arrive.
     """
     data_cfg = ibkr_cfg.get("data", {})
     delayed_cfg = data_cfg.get("delayed_data", {})
-    accept_delayed = delayed_cfg.get("accept", True)
-    ib.reqMarketDataType(3 if accept_delayed else 1)
-    ticker = ib.reqMktData(contract, "", False, False)
-    for _ in range(40):
-        await asyncio.sleep(0.5)
-        last = ticker.last
-        if last is not None and last == last:  # not NaN
-            logger.info(
-                "Market data active: last=%s bid=%s ask=%s (type=%s)",
-                last,
-                ticker.bid,
-                ticker.ask,
-                "delayed" if accept_delayed else "live",
-            )
-            return ticker
-        close = ticker.close
-        if close is not None and close == close:
-            logger.info("Market data active (close=%s)", close)
-            return ticker
+    accept_delayed = delayed_cfg.get("accept", False)
+    # Prefer live; optionally fall back to delayed / delayed-frozen.
+    types_to_try = [1, 3, 4] if accept_delayed else [1]
+    mdt_labels = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed-frozen"}
+    ticker = None
+
+    for mkt_type in types_to_try:
+        label = mdt_labels.get(mkt_type, str(mkt_type))
+        logger.info("Requesting market data type=%s (%s)", mkt_type, label)
+        ib.reqMarketDataType(mkt_type)
+        await asyncio.sleep(0.3)
+        if ticker is not None:
+            try:
+                ib.cancelMktData(contract)
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+        ticker = ib.reqMktData(contract, "", False, False)
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            last = ticker.last
+            if last is not None and last == last:  # not NaN
+                reported = getattr(ticker, "marketDataType", mkt_type)
+                logger.info(
+                    "Market data active: last=%s bid=%s ask=%s (requested=%s reported=%s)",
+                    last,
+                    ticker.bid,
+                    ticker.ask,
+                    label,
+                    mdt_labels.get(int(reported or mkt_type), reported),
+                )
+                return ticker
+            close = ticker.close
+            if close is not None and close == close:
+                logger.info("Market data active (close=%s, requested=%s)", close, label)
+                return ticker
+        logger.warning("No ticks yet for market data type=%s", label)
+
     if delayed_cfg.get("warn_user", True):
         msg = (
-            "No MNQ market data ticks received. In TWS/Gateway enable delayed market data "
-            "(Global Configuration -> Market Data) or subscribe to CME Nasdaq futures. "
+            "No MNQ market data ticks received. In TWS/Gateway enable market data "
+            "(live CME subscription preferred; delayed as fallback) "
+            "(Global Configuration -> Market Data). "
             "Until quotes flow, orders may be rejected (IB Error 354) and bars may not update."
         )
         logger.warning(msg)
@@ -535,8 +556,8 @@ async def refresh_feed_if_stale(
 ) -> bool:
     """Restart IB keepUpToDate subscription when the stream stops advancing.
 
-    Note: callers should run feed.poll_refetch_and_emit() first (the dashboard
-    maintenance loop does), so we only handle restart/cooldown logic here.
+    Note: callers run feed.poll_refetch_and_emit() first (boundary-aligned
+    failover in the dashboard maintenance loop), then this restart path.
     """
     if feed is None:
         return False
@@ -923,8 +944,8 @@ async def run_dashboard_maintenance(
     ticker = market_ticker or shared_state.get("market_data_ticker")
 
     if feed is not None:
-        # Active re-fetch: required for delayed data where keepUpToDate does not
-        # stream. Emits newly completed bars to the strategy bar-close handler.
+        # Stream-first: keepUpToDate emits bar closes. Boundary-aligned refetch
+        # (candle close + ~1s) fires only when the stream missed that close.
         poll_emitted = await feed.poll_refetch_and_emit()
         if poll_emitted:
             logger.info(

@@ -15,6 +15,7 @@ Key Features:
 import asyncio
 import pandas as pd
 import numpy as np
+import re
 from datetime import datetime, timedelta
 from typing import Optional, Callable, Dict, Any, List, Tuple
 import logging
@@ -24,6 +25,86 @@ from collections import deque
 from data.bar_index import bars_to_ohlcv_dataframe, normalize_bar_timestamp
 
 logger = logging.getLogger(__name__)
+
+
+def bar_size_to_seconds(bar_size: str) -> int:
+    """Convert IB barSizeSetting (e.g. '5 mins', '1 hour') to seconds."""
+    size = (bar_size or "10 mins").lower().strip()
+    if size in ("1 hour", "1hour", "60 mins", "60 min"):
+        return 3600
+    m = re.match(r"(\d+)\s*min", size)
+    if m:
+        return max(60, int(m.group(1)) * 60)
+    return 600
+
+
+def expected_closed_bar_ts(
+    now: datetime,
+    bar_interval_sec: int,
+    tz: Any,
+) -> Tuple[pd.Timestamp, float]:
+    """
+    Return (expected latest closed bar start, seconds into the current forming bar).
+
+    After a 5-min boundary at 16:35:00, the closed bar is the one that started 16:30:00.
+    """
+    ts = pd.Timestamp(now)
+    if ts.tzinfo is None:
+        ts = tz.localize(ts.to_pydatetime()) if hasattr(tz, "localize") else ts.tz_localize(tz)
+    else:
+        ts = ts.tz_convert(tz)
+
+    epoch = int(ts.timestamp())
+    floored = epoch - (epoch % int(bar_interval_sec))
+    sec_into_bar = (ts.timestamp() - floored)
+    current_start = pd.Timestamp(floored, unit="s", tz="UTC").tz_convert(tz)
+    closed_start = current_start - pd.Timedelta(seconds=int(bar_interval_sec))
+    return closed_start, float(sec_into_bar)
+
+
+def should_boundary_refetch(
+    *,
+    now: datetime,
+    bar_interval_sec: int,
+    tz: Any,
+    last_emitted: Optional[pd.Timestamp],
+    last_boundary_refetch_for: Optional[pd.Timestamp],
+    grace_sec: float = 1.0,
+    window_sec: float = 12.0,
+) -> Tuple[bool, pd.Timestamp, float]:
+    """
+    Stream-first gate for historical refetch failover.
+
+    Returns (should_refetch, expected_closed_ts, sec_into_bar).
+    Refetch only when the expected closed bar was not yet emitted and wall time is
+    in [grace_sec, grace_sec + window_sec] after the bar boundary.
+    """
+    expected_closed, sec_into_bar = expected_closed_bar_ts(now, bar_interval_sec, tz)
+
+    def _as_ts(value) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(tz)
+        else:
+            ts = ts.tz_convert(tz)
+        return ts
+
+    emitted = _as_ts(last_emitted)
+    if emitted is not None and emitted >= expected_closed:
+        return False, expected_closed, sec_into_bar
+
+    prev = _as_ts(last_boundary_refetch_for)
+    if prev is not None and prev >= expected_closed:
+        return False, expected_closed, sec_into_bar
+
+    if sec_into_bar < grace_sec:
+        return False, expected_closed, sec_into_bar
+    if sec_into_bar > grace_sec + window_sec:
+        return False, expected_closed, sec_into_bar
+
+    return True, expected_closed, sec_into_bar
 
 
 class RealtimeFeed:
@@ -87,8 +168,9 @@ class RealtimeFeed:
         self._last_emitted_closed_ts: Optional[pd.Timestamp] = None
         self._last_seen_bar_count: int = 0
         self._last_restart_wall: Optional[datetime] = None
-        # Active re-fetch (delayed data: keepUpToDate does NOT stream, so we poll).
+        # Boundary-aligned refetch failover when keepUpToDate stream misses a close.
         self._last_refetch_wall: Optional[datetime] = None
+        self._last_boundary_refetch_for: Optional[pd.Timestamp] = None
         self._max_buffer_bars: int = 8000
 
         # 1H bar tracking for multi-timeframe
@@ -298,14 +380,20 @@ class RealtimeFeed:
         lookback_days: int = 1,
         min_interval_sec: float = 45.0,
         only_when_market_open: bool = True,
+        grace_sec: float = 1.0,
+        window_sec: float = 12.0,
+        idle_catchup_sec: float = 10.0,
     ) -> int:
         """
-        Re-fetch recent historical bars and emit any newly completed bar.
+        Stream-first bar-close failover via a one-shot historical refetch.
 
-        Required for delayed market data, where reqHistoricalData(keepUpToDate=True)
-        does NOT stream live updates. A throttled one-shot historical request fetches
-        recent bars, merges them, and fires the strategy bar-close callback once per
-        new completed bar (deduped via the emit pointer).
+        Primary path: keepUpToDate stream emits ``Bar closed (stream)``.
+        Failover: if that close was not emitted by candle-boundary + grace_sec,
+        refetch once in a short post-boundary window (default 1–13s into the new bar).
+
+        ``idle_catchup_sec`` throttles rare catch-up refetches when we are still behind
+        after the boundary window (stale stream / missed maintenance tick).
+        ``min_interval_sec`` is kept for API compatibility (used as a floor for idle).
         """
         if not self._is_running:
             return 0
@@ -313,12 +401,63 @@ class RealtimeFeed:
             return 0
 
         now = datetime.now(self.timezone)
-        if (
-            self._last_refetch_wall is not None
-            and (now - self._last_refetch_wall).total_seconds() < min_interval_sec
-        ):
-            return 0
+        interval_sec = bar_size_to_seconds(self.bar_size)
+
+        do_boundary, expected_closed, sec_into_bar = should_boundary_refetch(
+            now=now,
+            bar_interval_sec=interval_sec,
+            tz=self.timezone,
+            last_emitted=self._last_emitted_closed_ts,
+            last_boundary_refetch_for=self._last_boundary_refetch_for,
+            grace_sec=grace_sec,
+            window_sec=window_sec,
+        )
+
+        # Already caught up (stream won or prior refetch emitted expected close).
+        if self._last_emitted_closed_ts is not None:
+            emitted = pd.Timestamp(self._last_emitted_closed_ts)
+            if emitted.tzinfo is None:
+                emitted = emitted.tz_localize(self.timezone)
+            else:
+                emitted = emitted.tz_convert(self.timezone)
+            if emitted >= expected_closed:
+                return 0
+
+        do_idle_catchup = False
+        if not do_boundary:
+            # Outside the tight boundary window but still missing the closed bar —
+            # rare catch-up so a missed window does not wait a full bar.
+            idle_floor = min(idle_catchup_sec, min_interval_sec) if min_interval_sec else idle_catchup_sec
+            if (
+                self._last_refetch_wall is None
+                or (now - self._last_refetch_wall).total_seconds() >= idle_floor
+            ):
+                # Only catch up if we are past the boundary window for the current expected close.
+                if sec_into_bar > grace_sec + window_sec:
+                    do_idle_catchup = True
+            if not do_idle_catchup:
+                return 0
+
+        if do_boundary:
+            logger.info(
+                "Boundary refetch failover: expected_closed=%s sec_into_bar=%.1f "
+                "(stream miss; grace=%.1fs)",
+                expected_closed,
+                sec_into_bar,
+                grace_sec,
+            )
+        else:
+            logger.info(
+                "Idle catch-up refetch: expected_closed=%s sec_into_bar=%.1f",
+                expected_closed,
+                sec_into_bar,
+            )
+
         self._last_refetch_wall = now
+        # Claim this boundary only after we start the request so a failed attempt
+        # can still retry inside the same post-boundary window.
+        if do_boundary:
+            self._last_boundary_refetch_for = expected_closed
 
         try:
             new_bars = await self.ib.reqHistoricalDataAsync(
@@ -333,19 +472,25 @@ class RealtimeFeed:
             )
         except Exception as e:
             logger.debug("Poll refetch failed: %s", e)
+            # Allow another try within the window on the next maintenance tick.
+            if do_boundary and self._last_boundary_refetch_for == expected_closed:
+                self._last_boundary_refetch_for = None
             return 0
 
         if not new_bars:
+            if do_boundary and self._last_boundary_refetch_for == expected_closed:
+                self._last_boundary_refetch_for = None
             return 0
 
         advanced = self._merge_bars(new_bars)
         if not advanced:
-            return 0
+            # Buffer may already contain the bar from a partial stream update;
+            # still attempt emit from the merged pointer.
+            pass
 
         self._build_dataframe()
         if self._bars:
             self._last_bar_time = self._normalize_bar_ts(self._bars[-1].date)
-        self._touch_stream_activity(now)
         self._last_seen_bar_count = len(self._bars)
 
         emitted = 0

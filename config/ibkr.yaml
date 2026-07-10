@@ -34,10 +34,11 @@ data:
     method: "reqHistoricalData"   # reqHistoricalData with keepUpToDate
     keep_up_to_date: true         # Stream updates to historical data
     
-  # Handle delayed data (if no live subscription)
+  # Prefer LIVE. Set accept:true only if you have no CME live subscription
+  # (then bot may fall back to delayed; bar closes use stream + boundary refetch).
   delayed_data:
-    accept: true                  # Accept delayed data if live unavailable
-    warn_user: true               # Show warning when using delayed
+    accept: false                  # false = live only (type 1); true = allow delayed fallback
+    warn_user: true               # Show warning when ticks never arrive
 
 # -----------------------------------------------------------------------------
 # PACING LIMITS (IBKR enforced)
