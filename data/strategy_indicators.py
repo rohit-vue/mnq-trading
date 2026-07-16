@@ -26,6 +26,25 @@ def _rename_st_columns(df: pd.DataFrame, side: str) -> pd.DataFrame:
     return df.rename(columns={c: f"{c}_{side}" for c in _ST_BASE_COLS})
 
 
+def _supertrend_cached(
+    cache: Dict[Tuple[int, float], pd.DataFrame],
+    df: pd.DataFrame,
+    *,
+    atr_length: int,
+    multiplier: float,
+) -> pd.DataFrame:
+    key = (int(atr_length), float(multiplier))
+    if key not in cache:
+        cache[key] = get_supertrend_signals(
+            df["high"],
+            df["low"],
+            df["close"],
+            atr_length=key[0],
+            multiplier=key[1],
+        )
+    return cache[key]
+
+
 def attach_long_short_indicators(
     df: pd.DataFrame,
     long_supertrend_entry: Dict[str, Any],
@@ -50,28 +69,21 @@ def attach_long_short_indicators(
     atr_sx = int(short_supertrend_exit.get("atr_length", 10))
     mult_sx = float(short_supertrend_exit.get("multiplier", 3.0))
 
+    st_cache: Dict[Tuple[int, float], pd.DataFrame] = {}
     st_l = _rename_st_columns(
-        get_supertrend_signals(
-            df["high"], df["low"], df["close"], atr_length=atr_l, multiplier=mult_l
-        ),
+        _supertrend_cached(df=df, cache=st_cache, atr_length=atr_l, multiplier=mult_l),
         "long",
     )
     st_s = _rename_st_columns(
-        get_supertrend_signals(
-            df["high"], df["low"], df["close"], atr_length=atr_s, multiplier=mult_s
-        ),
+        _supertrend_cached(df=df, cache=st_cache, atr_length=atr_s, multiplier=mult_s),
         "short",
     )
     st_lx = _rename_st_columns(
-        get_supertrend_signals(
-            df["high"], df["low"], df["close"], atr_length=atr_lx, multiplier=mult_lx
-        ),
+        _supertrend_cached(df=df, cache=st_cache, atr_length=atr_lx, multiplier=mult_lx),
         "long_exit",
     )
     st_sx = _rename_st_columns(
-        get_supertrend_signals(
-            df["high"], df["low"], df["close"], atr_length=atr_sx, multiplier=mult_sx
-        ),
+        _supertrend_cached(df=df, cache=st_cache, atr_length=atr_sx, multiplier=mult_sx),
         "short_exit",
     )
     out = pd.concat([df, st_l, st_s, st_lx, st_sx], axis=1)
@@ -172,18 +184,11 @@ def live_bar_indicator_slice(
     atr_sx = int(short_supertrend_exit.get("atr_length", 10))
     mult_sx = float(short_supertrend_exit.get("multiplier", 3.0))
 
-    st_l = get_supertrend_signals(
-        df["high"], df["low"], df["close"], atr_length=atr_l, multiplier=mult_l
-    )
-    st_s = get_supertrend_signals(
-        df["high"], df["low"], df["close"], atr_length=atr_s, multiplier=mult_s
-    )
-    st_lx = get_supertrend_signals(
-        df["high"], df["low"], df["close"], atr_length=atr_lx, multiplier=mult_lx
-    )
-    st_sx = get_supertrend_signals(
-        df["high"], df["low"], df["close"], atr_length=atr_sx, multiplier=mult_sx
-    )
+    st_cache: Dict[Tuple[int, float], pd.DataFrame] = {}
+    st_l = _supertrend_cached(df=df, cache=st_cache, atr_length=atr_l, multiplier=mult_l)
+    st_s = _supertrend_cached(df=df, cache=st_cache, atr_length=atr_s, multiplier=mult_s)
+    st_lx = _supertrend_cached(df=df, cache=st_cache, atr_length=atr_lx, multiplier=mult_lx)
+    st_sx = _supertrend_cached(df=df, cache=st_cache, atr_length=atr_sx, multiplier=mult_sx)
 
     di_l = int(long_adx.get("di_length", 14))
     sm_l = int(long_adx.get("adx_smoothing", 14))

@@ -291,6 +291,7 @@ class StateManager:
         current_direction : int
             Current ST direction (-1=bull, +1=bear)
         """
+        changed = False
         if st_bull_flip:
             logger.info("ST flipped BULLISH - resetting trade flags, cancelling pending waits")
             self.state.traded_in_bull_trend = False
@@ -301,6 +302,7 @@ class StateManager:
             self._clear_adx_wait_long_internal()
             self._clear_adx_wait_short_internal()
             self._clear_volume_wait_internal()
+            changed = True
         
         if st_bear_flip:
             logger.info("ST flipped BEARISH - resetting trade flags, cancelling pending waits")
@@ -312,8 +314,13 @@ class StateManager:
             self._clear_adx_wait_long_internal()
             self._clear_adx_wait_short_internal()
             self._clear_volume_wait_internal()
+            changed = True
         
+        if current_direction != self.state.prev_st_direction:
+            changed = True
         self.state.prev_st_direction = current_direction
+        if changed:
+            self.save_state()
     
     def _clear_volume_wait_internal(self) -> None:
         self.state.pending_volume_long = False
@@ -329,21 +336,29 @@ class StateManager:
         """Set pending long EMA wait (waiting for bullish EMA cross after unaligned ST flip)."""
         self.state.pending_long_ema_wait = True
         logger.info("Set pending_long_ema_wait: waiting for 1H Close > EMA200 with ADX >= threshold")
+        self.save_state()
     
     def clear_pending_long_ema_wait(self) -> None:
         """Clear pending long EMA wait."""
+        if not self.state.pending_long_ema_wait:
+            return
         self.state.pending_long_ema_wait = False
         logger.debug("Cleared pending_long_ema_wait")
+        self.save_state()
     
     def set_pending_short_ema_wait(self) -> None:
         """Set pending short EMA wait (waiting for bearish EMA cross after unaligned ST flip)."""
         self.state.pending_short_ema_wait = True
         logger.info("Set pending_short_ema_wait: waiting for 1H Close < EMA200 with ADX >= threshold")
+        self.save_state()
     
     def clear_pending_short_ema_wait(self) -> None:
         """Clear pending short EMA wait."""
+        if not self.state.pending_short_ema_wait:
+            return
         self.state.pending_short_ema_wait = False
         logger.debug("Cleared pending_short_ema_wait")
+        self.save_state()
     
     # ----- ADX wait methods -----
     
@@ -356,11 +371,15 @@ class StateManager:
             f"Set ADX wait LONG: trigger={trigger}, {bars} bars window, "
             f"waiting for ADX >= threshold"
         )
+        self.save_state()
     
     def clear_adx_wait_long(self) -> None:
         """Clear pending ADX wait for long."""
+        if not self.state.pending_adx_long and self.state.adx_wait_bars_left_long == 0:
+            return
         self._clear_adx_wait_long_internal()
         logger.debug("Cleared pending_adx_long")
+        self.save_state()
 
     def _clear_adx_wait_long_internal(self) -> None:
         """Internal clear without logging (used by update_supertrend_state)."""
@@ -374,6 +393,7 @@ class StateManager:
         if self.state.adx_wait_bars_left_long <= 0:
             logger.info("ADX wait LONG expired: 5-bar window exhausted")
             self._clear_adx_wait_long_internal()
+        self.save_state()
     
     def set_adx_wait_short(self, bars: int, trigger: str) -> None:
         """Start 5-bar ADX confirmation window for a short entry."""
@@ -384,11 +404,15 @@ class StateManager:
             f"Set ADX wait SHORT: trigger={trigger}, {bars} bars window, "
             f"waiting for ADX >= threshold"
         )
+        self.save_state()
     
     def clear_adx_wait_short(self) -> None:
         """Clear pending ADX wait for short."""
+        if not self.state.pending_adx_short and self.state.adx_wait_bars_left_short == 0:
+            return
         self._clear_adx_wait_short_internal()
         logger.debug("Cleared pending_adx_short")
+        self.save_state()
     
     def _clear_adx_wait_short_internal(self) -> None:
         """Internal clear without logging (used by update_supertrend_state)."""
@@ -402,6 +426,7 @@ class StateManager:
         if self.state.adx_wait_bars_left_short <= 0:
             logger.info("ADX wait SHORT expired: 5-bar window exhausted")
             self._clear_adx_wait_short_internal()
+        self.save_state()
     
     def set_volume_wait_long(self, bars_left: int, trigger: str, kind: str) -> None:
         self.state.pending_volume_long = True
@@ -411,6 +436,7 @@ class StateManager:
         logger.info(
             f"Volume wait LONG: {bars_left} bar(s) left, trigger={trigger}, kind={kind}"
         )
+        self.save_state()
     
     def set_volume_wait_short(self, bars_left: int, trigger: str, kind: str) -> None:
         self.state.pending_volume_short = True
@@ -420,24 +446,33 @@ class StateManager:
         logger.info(
             f"Volume wait SHORT: {bars_left} bar(s) left, trigger={trigger}, kind={kind}"
         )
+        self.save_state()
     
     def clear_volume_wait_long(self) -> None:
+        if not self.state.pending_volume_long and self.state.volume_wait_bars_left_long == 0:
+            return
         self.state.pending_volume_long = False
         self.state.volume_wait_bars_left_long = 0
         self.state.volume_wait_trigger_long = ''
         self.state.volume_wait_kind_long = ''
+        self.save_state()
     
     def clear_volume_wait_short(self) -> None:
+        if not self.state.pending_volume_short and self.state.volume_wait_bars_left_short == 0:
+            return
         self.state.pending_volume_short = False
         self.state.volume_wait_bars_left_short = 0
         self.state.volume_wait_trigger_short = ''
         self.state.volume_wait_kind_short = ''
+        self.save_state()
     
     def decrement_volume_wait_long(self) -> None:
         self.state.volume_wait_bars_left_long -= 1
+        self.save_state()
     
     def decrement_volume_wait_short(self) -> None:
         self.state.volume_wait_bars_left_short -= 1
+        self.save_state()
     
     def on_entry(
         self,
@@ -631,9 +666,20 @@ class StateManager:
                 with open(self.state_file, 'r') as f:
                     data = json.load(f)
                     self.state = StrategyState.from_dict(data)
-                logger.info(f"State loaded: position={self.state.position_size}, "
-                          f"bull_traded={self.state.traded_in_bull_trend}, "
-                          f"bear_traded={self.state.traded_in_bear_trend}")
+                logger.info(
+                    "State loaded: position=%s, bull_traded=%s, bear_traded=%s, "
+                    "pendEMA_L=%s, pendEMA_S=%s, pendADX_L=%s, pendADX_S=%s, "
+                    "prev_st=%s, trades=%s",
+                    self.state.position_size,
+                    self.state.traded_in_bull_trend,
+                    self.state.traded_in_bear_trend,
+                    self.state.pending_long_ema_wait,
+                    self.state.pending_short_ema_wait,
+                    self.state.pending_adx_long,
+                    self.state.pending_adx_short,
+                    self.state.prev_st_direction,
+                    self.state.trade_count,
+                )
                 self.repair_flat_dual_trade_flags()
             except Exception as e:
                 logger.error(f"Failed to load state: {e}")

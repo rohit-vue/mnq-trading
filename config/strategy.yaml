@@ -27,7 +27,7 @@ short_supertrend_entry:
 
 short_supertrend_exit:
   atr_length: 12
-  multiplier: 4
+  multiplier: 5
 
 # Side-level aliases (optional): used when *_entry / *_exit are missing
 long_supertrend:
@@ -123,6 +123,16 @@ execution:
   process_orders_on_close: true       # Execute signals at bar close only
   initial_capital: 100000             # Starting capital for backtesting
   independent_books: false             # Backtest long/short in isolated books, then merge
+  fast_tick_bar_close:
+    enabled: true                    # true = build primary bars from live ticks and evaluate at clock boundary
+    grace_sec: 0.25                   # seconds after boundary before freezing local tick-built bar
+    reconcile_official: true          # log official IB OHLC vs tick-built OHLC when stream/refetch arrives later
+    stale_resubscribe:
+      enabled: true                   # auto re-request reqMktData if ticker.last freezes while IB bars keep moving
+      stale_sec: 90                   # seconds without a last-trade price change before checking for recovery
+      cooldown_sec: 120               # minimum seconds between market-data resubscribe attempts
+      min_price_gap_points: 4         # require feed close to differ from stale last by at least this many points
+      recent_stream_sec: 30           # only resubscribe if keepUpToDate/refetch stream was active this recently
 
 # -----------------------------------------------------------------------------
 # BAR CLOSE LOGIC

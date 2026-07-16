@@ -17,6 +17,7 @@ import pandas as pd
 import numpy as np
 import re
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Optional, Callable, Dict, Any, List, Tuple
 import logging
 import pytz
@@ -171,6 +172,8 @@ class RealtimeFeed:
         # Boundary-aligned refetch failover when keepUpToDate stream misses a close.
         self._last_refetch_wall: Optional[datetime] = None
         self._last_boundary_refetch_for: Optional[pd.Timestamp] = None
+        self._synthetic_closed_bars: Dict[pd.Timestamp, Any] = {}
+        self.reconcile_synthetic_official: bool = True
         self._max_buffer_bars: int = 8000
 
         # 1H bar tracking for multi-timeframe
@@ -332,9 +335,32 @@ class RealtimeFeed:
             self._last_emitted_closed_ts is not None
             and closed_ts <= self._last_emitted_closed_ts
         ):
+            if (
+                self.reconcile_synthetic_official
+                and source != "tick"
+                and closed_ts in self._synthetic_closed_bars
+            ):
+                tick_bar = self._synthetic_closed_bars[closed_ts]
+                logger.info(
+                    "OFFICIAL_BAR_RECONCILE | ts=%s | source=%s | "
+                    "tick_O=%.2f tick_H=%.2f tick_L=%.2f tick_C=%.2f | "
+                    "official_O=%.2f official_H=%.2f official_L=%.2f official_C=%.2f",
+                    closed_ts,
+                    source,
+                    float(getattr(tick_bar, "open", 0) or 0),
+                    float(getattr(tick_bar, "high", 0) or 0),
+                    float(getattr(tick_bar, "low", 0) or 0),
+                    float(getattr(tick_bar, "close", 0) or 0),
+                    float(getattr(closed_bar, "open", 0) or 0),
+                    float(getattr(closed_bar, "high", 0) or 0),
+                    float(getattr(closed_bar, "low", 0) or 0),
+                    float(getattr(closed_bar, "close", 0) or 0),
+                )
             return
 
         self._last_emitted_closed_ts = closed_ts
+        if source == "tick":
+            self._synthetic_closed_bars[closed_ts] = closed_bar
         self._touch_stream_activity()
         logger.info(
             "Bar closed (%s): %s | O=%.2f H=%.2f L=%.2f C=%.2f | bars=%s",
@@ -347,6 +373,44 @@ class RealtimeFeed:
             len(self._bars),
         )
         self._emit_bar_close(closed_bar)
+
+    def emit_external_bar(self, bar, *, source: str = "tick") -> bool:
+        """Merge and emit a locally built closed bar (used by tick fast path)."""
+        if not self._is_running:
+            return False
+        closed_ts = self._normalize_bar_ts(bar.date)
+        if (
+            self._last_emitted_closed_ts is not None
+            and closed_ts <= self._last_emitted_closed_ts
+        ):
+            return False
+
+        merge_bars = [bar]
+        if not self._bars or self._normalize_bar_ts(self._bars[-1].date) <= closed_ts:
+            # on_bar_close expects the signal bar at df.iloc[-2] and a forming
+            # bar at df.iloc[-1]. Add a zero-volume placeholder if the tick path
+            # beats the first tick/stream update of the next bar.
+            next_ts = closed_ts + pd.Timedelta(seconds=bar_size_to_seconds(self.bar_size))
+            merge_bars.append(
+                SimpleNamespace(
+                    date=next_ts.to_pydatetime(),
+                    open=float(bar.close),
+                    high=float(bar.close),
+                    low=float(bar.close),
+                    close=float(bar.close),
+                    volume=0.0,
+                    average=float(bar.close),
+                    barCount=0,
+                )
+            )
+
+        self._merge_bars(merge_bars)
+        self._build_dataframe()
+        if self._bars:
+            self._last_bar_time = self._normalize_bar_ts(self._bars[-1].date)
+        self._last_seen_bar_count = len(self._bars)
+        self._process_closed_bar(bar, source=source)
+        return True
 
     def _merge_bars(self, new_bars) -> bool:
         """

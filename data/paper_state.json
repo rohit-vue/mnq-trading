@@ -1,12 +1,12 @@
 {
-  "position_size": 0,
-  "entry_price": 0.0,
-  "entry_time": null,
-  "stop_loss": 0.0,
-  "take_profit": 0.0,
-  "traded_in_bull_trend": true,
+  "position_size": -1,
+  "entry_price": 29666.75,
+  "entry_time": "2026-07-16 02:30:00-04:00",
+  "stop_loss": 29770.583625000003,
+  "take_profit": 29073.415,
+  "traded_in_bull_trend": false,
   "traded_in_bear_trend": false,
-  "prev_st_direction": -1.0,
+  "prev_st_direction": 1.0,
   "pending_long_ema_wait": false,
   "pending_short_ema_wait": false,
   "pending_adx_long": false,
@@ -23,7 +23,7 @@
   "volume_wait_trigger_short": "",
   "volume_wait_kind_long": "",
   "volume_wait_kind_short": "",
-  "trade_count": 41,
-  "daily_trades": 41,
-  "daily_pnl": -2717.2729999999938
+  "trade_count": 48,
+  "daily_trades": 48,
+  "daily_pnl": -2820.1072499999937
 }

@@ -141,6 +141,149 @@ async def ensure_market_data(ib, contract: Any, ibkr_cfg: dict) -> Any:
     return ticker
 
 
+def fast_tick_bar_close_config(strategy_cfg: dict) -> dict:
+    raw = strategy_cfg.get("execution", {}).get("fast_tick_bar_close", {})
+    if isinstance(raw, bool):
+        return {
+            "enabled": raw,
+            "grace_sec": 0.25,
+            "reconcile_official": True,
+            "stale_resubscribe": {
+                "enabled": True,
+                "stale_sec": 90.0,
+                "cooldown_sec": 120.0,
+                "min_price_gap_points": 4.0,
+                "recent_stream_sec": 30.0,
+            },
+        }
+    raw = raw or {}
+    stale_raw = raw.get("stale_resubscribe", {})
+    if isinstance(stale_raw, bool):
+        stale_raw = {"enabled": stale_raw}
+    stale_raw = stale_raw or {}
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "grace_sec": float(raw.get("grace_sec", 0.25)),
+        "reconcile_official": bool(raw.get("reconcile_official", True)),
+        "stale_resubscribe": {
+            "enabled": bool(stale_raw.get("enabled", True)),
+            "stale_sec": float(stale_raw.get("stale_sec", 90.0)),
+            "cooldown_sec": float(stale_raw.get("cooldown_sec", 120.0)),
+            "min_price_gap_points": float(stale_raw.get("min_price_gap_points", 4.0)),
+            "recent_stream_sec": float(stale_raw.get("recent_stream_sec", 30.0)),
+        },
+    }
+
+
+def read_ticker_last_trade(ticker: Any) -> Optional[float]:
+    """Raw last-trade price used by the tick-built OHLC path."""
+    if ticker is None:
+        return None
+    val = getattr(ticker, "last", None)
+    if callable(val):
+        try:
+            val = val()
+        except Exception:
+            return None
+    if val is None or val != val:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _record_market_data_tick(shared_state: Optional[dict], ticker: Any) -> None:
+    if shared_state is None:
+        return
+    now = datetime.now(pytz.UTC)
+    shared_state["market_data_last_update_wall"] = now
+    last = read_ticker_last_trade(ticker)
+    if last is None:
+        return
+    prev = shared_state.get("market_data_last_trade")
+    if prev is None or abs(float(prev) - last) > 1e-9:
+        shared_state["market_data_last_price_change_wall"] = now
+        shared_state["market_data_last_trade"] = last
+
+
+def detach_tick_bar_builder(ticker: Any, handler: Any) -> None:
+    """Remove a prior reqMktData update handler before replacing a ticker."""
+    if ticker is None or handler is None:
+        return
+    try:
+        ticker.updateEvent -= handler
+    except (ValueError, AttributeError):
+        pass
+
+
+def attach_tick_bar_builder(ticker: Any, builder: Any, shared_state: Optional[dict] = None) -> Any:
+    """Feed reqMktData ticker updates into the local tick bar builder."""
+    if ticker is None:
+        return None
+
+    def on_ticker_update(_ticker=ticker) -> None:
+        _record_market_data_tick(shared_state, _ticker)
+        builder.update_from_ticker(_ticker)
+
+    ticker.updateEvent += on_ticker_update
+    # Seed from the current snapshot if one is already populated.
+    _record_market_data_tick(shared_state, ticker)
+    builder.update_from_ticker(ticker)
+    return on_ticker_update
+
+
+async def run_fast_tick_bar_close_loop(
+    *,
+    mode_label: str,
+    contract_label: str,
+    feed: Any,
+    builder: Any,
+    shared_state: dict,
+    grace_sec: float,
+) -> None:
+    """Emit tick-built bars at primary-timeframe boundaries."""
+    logger.info(
+        "FAST_TICK_BAR_CLOSE enabled | mode=%s | contract=%s | bar_size=%s | grace_sec=%.3f",
+        mode_label,
+        contract_label,
+        getattr(builder, "bar_size", "n/a"),
+        grace_sec,
+    )
+    while shared_state.get("running", False):
+        try:
+            await asyncio.sleep(builder.seconds_until_next_emit(grace_sec=grace_sec))
+            if not shared_state.get("running", False):
+                break
+            active_feed = shared_state.get("feed", feed)
+            if active_feed is None:
+                continue
+            tick_bar = builder.finalize_expected_closed()
+            if tick_bar is None:
+                logger.debug("FAST_TICK_BAR_CLOSE skipped: no local bar to freeze")
+                continue
+            emitted = active_feed.emit_external_bar(tick_bar.to_bar(), source="tick")
+            if emitted:
+                logger.info(
+                    "TICK_BAR_CLOSE | mode=%s | contract=%s | bar_end=%s | "
+                    "O=%.4f H=%.4f L=%.4f C=%.4f | volume_proxy=%.0f | ticks=%s",
+                    mode_label,
+                    shared_state.get("contract_label", contract_label),
+                    tick_bar.start.isoformat(),
+                    tick_bar.open,
+                    tick_bar.high,
+                    tick_bar.low,
+                    tick_bar.close,
+                    tick_bar.volume,
+                    tick_bar.bar_count,
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.exception("FAST_TICK_BAR_CLOSE error: %s", exc)
+            await asyncio.sleep(1)
+
+
 def resolve_ib_client_id(conn_cfg: dict) -> int:
     """
     IBKR allows one socket per (host, port, client_id). Error 326 means ID is already in use.
@@ -585,6 +728,116 @@ async def refresh_feed_if_stale(
     return True
 
 
+async def recover_stale_market_data(
+    *,
+    ib: Any,
+    mode_label: str,
+    contract_label: str,
+    feed: Any,
+    ticker: Any,
+    shared_state: dict,
+    strategy_cfg: dict,
+    ibkr_cfg: dict,
+) -> Any:
+    """Resubscribe reqMktData when live last-trade ticks freeze but bars keep moving."""
+    fast_cfg = fast_tick_bar_close_config(strategy_cfg)
+    stale_cfg = fast_cfg.get("stale_resubscribe", {})
+    if not fast_cfg.get("enabled") or not stale_cfg.get("enabled", True):
+        return ticker
+
+    builder = shared_state.get("tick_bar_builder")
+    contract = shared_state.get("contract")
+    if builder is None or contract is None or ticker is None or feed is None:
+        return ticker
+    if hasattr(feed, "is_market_hours") and not feed.is_market_hours(check_rth=False):
+        return ticker
+
+    now = datetime.now(pytz.UTC)
+    last_change = shared_state.get("market_data_last_price_change_wall")
+    if last_change is None:
+        last_change = shared_state.get("market_data_last_update_wall")
+    if last_change is None:
+        return ticker
+    if getattr(last_change, "tzinfo", None) is None:
+        last_change = pytz.UTC.localize(last_change)
+
+    stale_sec = float(stale_cfg.get("stale_sec", 90.0))
+    stale_age = (now - last_change).total_seconds()
+    if stale_age < stale_sec:
+        return ticker
+
+    stream_idle_min = None
+    if hasattr(feed, "minutes_since_stream_activity"):
+        stream_idle_min = feed.minutes_since_stream_activity()
+    recent_stream_sec = float(stale_cfg.get("recent_stream_sec", 30.0))
+    if stream_idle_min is None or (stream_idle_min * 60.0) > recent_stream_sec:
+        return ticker
+
+    last_trade = read_ticker_last_trade(ticker)
+    feed_close = None
+    df = feed.get_dataframe() if hasattr(feed, "get_dataframe") else None
+    if df is not None and len(df) > 0:
+        try:
+            feed_close = float(df.iloc[-1]["close"])
+        except (TypeError, ValueError, KeyError):
+            feed_close = None
+
+    price_gap = None
+    if last_trade is not None and feed_close is not None:
+        price_gap = abs(feed_close - last_trade)
+        min_gap = float(stale_cfg.get("min_price_gap_points", 4.0))
+        if price_gap < min_gap:
+            return ticker
+    elif stale_age < stale_sec * 2.0:
+        # If we cannot compare prices, wait for stronger evidence before cycling.
+        return ticker
+
+    cooldown_sec = float(stale_cfg.get("cooldown_sec", 120.0))
+    last_resub = shared_state.get("market_data_last_resubscribe_wall")
+    if last_resub is not None:
+        if getattr(last_resub, "tzinfo", None) is None:
+            last_resub = pytz.UTC.localize(last_resub)
+        if (now - last_resub).total_seconds() < cooldown_sec:
+            return ticker
+
+    shared_state["market_data_last_resubscribe_wall"] = now
+    logger.warning(
+        "MARKET_DATA_STALE_RESUBSCRIBE | mode=%s | contract=%s | stale_sec=%.0f | "
+        "last=%s | feed_close=%s | gap=%s | stream_idle_sec=%.1f",
+        mode_label,
+        contract_label,
+        stale_age,
+        f"{last_trade:.2f}" if last_trade is not None else "n/a",
+        f"{feed_close:.2f}" if feed_close is not None else "n/a",
+        f"{price_gap:.2f}" if price_gap is not None else "n/a",
+        stream_idle_min * 60.0,
+    )
+
+    old_handler = shared_state.get("tick_bar_update_handler")
+    detach_tick_bar_builder(ticker, old_handler)
+    try:
+        ib.cancelMktData(contract)
+    except Exception as exc:
+        logger.debug("Could not cancel stale market data for %s: %s", contract_label, exc)
+
+    try:
+        await asyncio.sleep(0.2)
+        new_ticker = await ensure_market_data(ib, contract, ibkr_cfg)
+        if new_ticker is None:
+            return ticker
+        shared_state["market_data_ticker"] = new_ticker
+        shared_state["tick_bar_update_handler"] = attach_tick_bar_builder(
+            new_ticker,
+            builder,
+            shared_state=shared_state,
+        )
+        logger.info("MARKET_DATA_RESUBSCRIBED | mode=%s | contract=%s", mode_label, contract_label)
+        return new_ticker
+    except Exception as exc:
+        logger.exception("MARKET_DATA_RESUBSCRIBE_FAILED | mode=%s | contract=%s | error=%s", mode_label, contract_label, exc)
+        return ticker
+
+
 def reset_roll_state_flags(state_manager: Any) -> None:
     """Reset per-contract trend/wait state when the active futures month changes."""
     state_manager.state.traded_in_bull_trend = False
@@ -714,6 +967,8 @@ async def maybe_roll_mnq_contract(
     if qualified:
         new_contract = qualified[0]
     old_ticker = shared_state.get("market_data_ticker")
+    old_handler = shared_state.get("tick_bar_update_handler")
+    detach_tick_bar_builder(old_ticker, old_handler)
     if old_ticker is not None:
         try:
             ib.cancelMktData(old_contract)
@@ -728,6 +983,13 @@ async def maybe_roll_mnq_contract(
     shared_state["contract"] = new_contract
     shared_state["contract_label"] = new_label
     shared_state["market_data_ticker"] = await ensure_market_data(ib, new_contract, ibkr_cfg)
+    builder = shared_state.get("tick_bar_builder")
+    if builder is not None:
+        shared_state["tick_bar_update_handler"] = attach_tick_bar_builder(
+            shared_state.get("market_data_ticker"),
+            builder,
+            shared_state=shared_state,
+        )
     await position_tracker.initialize()
     await feed.start(initial_lookback_days=15)
     seed_dashboard_prices_from_feed(dashboard, feed)
@@ -953,6 +1215,17 @@ async def run_dashboard_maintenance(
                 poll_emitted,
                 mode_label,
             )
+
+    ticker = await recover_stale_market_data(
+        ib=ib,
+        mode_label=mode_label,
+        contract_label=contract_label,
+        feed=feed,
+        ticker=ticker,
+        shared_state=shared_state,
+        strategy_cfg=strategy_cfg,
+        ibkr_cfg=ibkr_cfg,
+    )
 
     price, price_src = resolve_market_price(shared_state, feed)
     if price is None:
@@ -1605,6 +1878,21 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
         )
         shared_state['mtf'] = mtf
 
+        fast_tick_cfg = fast_tick_bar_close_config(strategy_cfg)
+        tick_bar_builder = None
+        tick_bar_task = None
+        if fast_tick_cfg["enabled"]:
+            from data.tick_bar_builder import TickBarBuilder
+
+            tick_bar_builder = TickBarBuilder(bar_size=primary_bar_size)
+            primary_feed.reconcile_synthetic_official = fast_tick_cfg["reconcile_official"]
+            shared_state["tick_bar_update_handler"] = attach_tick_bar_builder(
+                shared_state.get("market_data_ticker"),
+                tick_bar_builder,
+                shared_state=shared_state,
+            )
+            shared_state["tick_bar_builder"] = tick_bar_builder
+
         # Dashboard update task
         async def update_dashboard_loop():
             """Update dashboard periodically."""
@@ -1669,46 +1957,26 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
                     return
                 active_contract_label = shared_state.get("contract_label", contract_label)
 
-                from data.live_bar_alignment import enrich_10m_with_1h_like_backtest
+                from data.live_bar_close import prepare_bar_close_row
 
-                inds = live_bar_indicator_slice(
-                    df,
-                    sides["long_supertrend_entry"],
-                    sides["short_supertrend_entry"],
-                    sides["long_adx"],
-                    sides["short_adx"],
-                    long_supertrend_exit=sides["long_supertrend_exit"],
-                    short_supertrend_exit=sides["short_supertrend_exit"],
-                    row_i=-2,
+                current_bar, prep_timings = prepare_bar_close_row(
+                    df=df,
+                    mtf=mtf,
+                    sides=sides,
+                    strategy_cfg=strategy_cfg,
+                    ema_cfg=ema_cfg,
+                    mode_label="PAPER",
                 )
-                # Same 1H mapping + cross logic as HistoricalDataLoader.prepare_strategy_data / backtest
-                df_1h = mtf.aggregate_1h_from_10m(df)
-                ema_len = int(ema_cfg.get("length", 200))
-                if len(df_1h) < ema_len:
-                    logger.warning(
-                        "EMA_WARMUP | mode=PAPER | 1H bars=%s < EMA length=%s | "
-                        "1H EMA200 is NOT fully warmed (buffer=%s primary bars) — EMA filter may "
-                        "diverge from backtest until more history is loaded",
-                        len(df_1h),
-                        ema_len,
-                        len(df),
-                    )
-                df_aligned = enrich_10m_with_1h_like_backtest(
-                    df, df_1h, ema_len
+                logger.info(
+                    "BAR_CLOSE_TIMING | mode=PAPER | contract=%s | bar_end=%s | "
+                    "indicators_ms=%.0f | mtf_ms=%.0f | row_ms=%.0f | prepare_ms=%.0f",
+                    active_contract_label,
+                    current_bar.name,
+                    prep_timings["indicators_ms"],
+                    prep_timings["mtf_ms"],
+                    prep_timings["row_ms"],
+                    prep_timings["prepare_ms"],
                 )
-                current_bar = df_aligned.iloc[-2].copy()
-                for k, v in inds.items():
-                    current_bar[k] = v
-
-                if 'volume' in df.columns and len(df) >= max(1, int(strategy_cfg.get('volume_ma_period', 20))):
-                    current_bar['volume_ma'] = float(
-                        df['volume'].rolling(
-                            max(1, int(strategy_cfg.get('volume_ma_period', 20))),
-                            min_periods=max(1, int(strategy_cfg.get('volume_ma_period', 20)))
-                        ).mean().iloc[-2]
-                    )
-                else:
-                    current_bar['volume_ma'] = np.nan
 
                 # Update dashboard indicators
                 st_dir = "BULL" if current_bar.get('direction_long', current_bar.get('direction', 0)) == -1 else "BEAR"
@@ -1734,17 +2002,16 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
                     events = "SuperTrend flipped BEARISH"
                     dashboard.print_event("SIGNAL", events)
                 if current_bar.get('st_bull_flip', False) or current_bar.get('st_bear_flip', False):
-                    # Telegram is a non-critical side effect: never let a notification
-                    # failure abort the bar's entry/exit evaluation.
-                    try:
-                        await handle_supertrend_flip_telegram(
+                    # Telegram is non-critical; keep network I/O off the signal/order path.
+                    notify_telegram_background(
+                        telegram,
+                        handle_supertrend_flip_telegram(
                             telegram,
                             current_bar,
                             mode_label="PAPER",
                             contract_label=active_contract_label,
-                        )
-                    except Exception as notify_err:
-                        logger.error("SuperTrend flip Telegram notify failed (continuing): %s", notify_err)
+                        ),
+                    )
                 if current_bar.get('ema_bull_cross', False):
                     events = "EMA Cross BULLISH"
                     dashboard.print_event("SIGNAL", events)
@@ -1812,17 +2079,19 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
                             pnl_dollars=pnl_dollars
                         )
 
-                        # Telegram notification for trade closure
-                        await telegram.notify_trade_closed(
-                            direction=direction,
-                            entry_price=state.entry_price,
-                            exit_price=exit_signal.exit_price,
-                            exit_reason=exit_signal.exit_type.value,
-                            pnl_points=pnl_points,
-                            pnl_dollars=pnl_dollars,
-                            contracts=contracts,
-                            trade_id=state.trade_count,
-                            entry_time=state.entry_time
+                        notify_telegram_background(
+                            telegram,
+                            telegram.notify_trade_closed(
+                                direction=direction,
+                                entry_price=state.entry_price,
+                                exit_price=exit_signal.exit_price,
+                                exit_reason=exit_signal.exit_type.value,
+                                pnl_points=pnl_points,
+                                pnl_dollars=pnl_dollars,
+                                contracts=contracts,
+                                trade_id=state.trade_count,
+                                entry_time=state.entry_time,
+                            ),
                         )
 
                         state_manager.on_exit(exit_signal)
@@ -1946,16 +2215,18 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
                             trade_id,
                         )
 
-                        # Telegram notification for trade placement
-                        await telegram.notify_trade_placed(
-                            direction=direction,
-                            entry_price=entry_signal.price,
-                            stop_loss=stop_loss,
-                            take_profit=take_profit,
-                            contracts=contracts,
-                            trigger=entry_signal.trigger,
-                            trade_id=trade_id,
-                            actual_fill_price=actual_fill_price,
+                        notify_telegram_background(
+                            telegram,
+                            telegram.notify_trade_placed(
+                                direction=direction,
+                                entry_price=entry_signal.price,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                contracts=contracts,
+                                trigger=entry_signal.trigger,
+                                trade_id=trade_id,
+                                actual_fill_price=actual_fill_price,
+                            ),
                         )
             except Exception as e:
                 logger.exception("Paper on_bar_close failed: %s", e)
@@ -1974,6 +2245,18 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
             len(_df0) if _df0 is not None else 0,
         )
         
+        if tick_bar_builder is not None:
+            tick_bar_task = asyncio.create_task(
+                run_fast_tick_bar_close_loop(
+                    mode_label="PAPER",
+                    contract_label=shared_state.get("contract_label", contract_label),
+                    feed=primary_feed,
+                    builder=tick_bar_builder,
+                    shared_state=shared_state,
+                    grace_sec=fast_tick_cfg["grace_sec"],
+                )
+            )
+
         # Start dashboard update task
         dashboard_task = asyncio.create_task(update_dashboard_loop())
         
@@ -2004,6 +2287,21 @@ async def run_paper_trading_v2(config: dict, contracts: Optional[int] = None) ->
             stop_reason = "User requested shutdown (Ctrl+C)"
 
         shared_state['running'] = False
+        try:
+            state_manager.save_state()
+            logger.info(
+                "STATE_SAVED_ON_SHUTDOWN | mode=PAPER | pendEMA_L=%s | pendEMA_S=%s | "
+                "tradedBull=%s | tradedBear=%s | position=%s",
+                state_manager.state.pending_long_ema_wait,
+                state_manager.state.pending_short_ema_wait,
+                state_manager.state.traded_in_bull_trend,
+                state_manager.state.traded_in_bear_trend,
+                state_manager.state.position_size,
+            )
+        except Exception as save_exc:
+            logger.error("Failed to save paper state on shutdown: %s", save_exc)
+        if tick_bar_task is not None:
+            tick_bar_task.cancel()
         dashboard_task.cancel()
 
         await telegram.notify_bot_stopped(stop_reason)
@@ -2299,6 +2597,21 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
         )
         shared_state['mtf'] = mtf
 
+        fast_tick_cfg = fast_tick_bar_close_config(strategy_cfg)
+        tick_bar_builder = None
+        tick_bar_task = None
+        if fast_tick_cfg["enabled"]:
+            from data.tick_bar_builder import TickBarBuilder
+
+            tick_bar_builder = TickBarBuilder(bar_size=primary_bar_size)
+            primary_feed.reconcile_synthetic_official = fast_tick_cfg["reconcile_official"]
+            shared_state["tick_bar_update_handler"] = attach_tick_bar_builder(
+                shared_state.get("market_data_ticker"),
+                tick_bar_builder,
+                shared_state=shared_state,
+            )
+            shared_state["tick_bar_builder"] = tick_bar_builder
+
         # Dashboard update task
         async def update_dashboard_loop():
             """Update dashboard periodically."""
@@ -2359,45 +2672,26 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
                     return
                 active_contract_label = shared_state.get("contract_label", contract_label)
 
-                from data.live_bar_alignment import enrich_10m_with_1h_like_backtest
+                from data.live_bar_close import prepare_bar_close_row
 
-                inds = live_bar_indicator_slice(
-                    df,
-                    sides["long_supertrend_entry"],
-                    sides["short_supertrend_entry"],
-                    sides["long_adx"],
-                    sides["short_adx"],
-                    long_supertrend_exit=sides["long_supertrend_exit"],
-                    short_supertrend_exit=sides["short_supertrend_exit"],
-                    row_i=-2,
+                current_bar, prep_timings = prepare_bar_close_row(
+                    df=df,
+                    mtf=mtf,
+                    sides=sides,
+                    strategy_cfg=strategy_cfg,
+                    ema_cfg=ema_cfg,
+                    mode_label="LIVE",
                 )
-                df_1h = mtf.aggregate_1h_from_10m(df)
-                ema_len = int(ema_cfg.get("length", 200))
-                if len(df_1h) < ema_len:
-                    logger.warning(
-                        "EMA_WARMUP | mode=LIVE | 1H bars=%s < EMA length=%s | "
-                        "1H EMA200 is NOT fully warmed (buffer=%s primary bars) — EMA filter may "
-                        "diverge from backtest until more history is loaded",
-                        len(df_1h),
-                        ema_len,
-                        len(df),
-                    )
-                df_aligned = enrich_10m_with_1h_like_backtest(
-                    df, df_1h, ema_len
+                logger.info(
+                    "BAR_CLOSE_TIMING | mode=LIVE | contract=%s | bar_end=%s | "
+                    "indicators_ms=%.0f | mtf_ms=%.0f | row_ms=%.0f | prepare_ms=%.0f",
+                    active_contract_label,
+                    current_bar.name,
+                    prep_timings["indicators_ms"],
+                    prep_timings["mtf_ms"],
+                    prep_timings["row_ms"],
+                    prep_timings["prepare_ms"],
                 )
-                current_bar = df_aligned.iloc[-2].copy()
-                for k, v in inds.items():
-                    current_bar[k] = v
-
-                if 'volume' in df.columns and len(df) >= max(1, int(strategy_cfg.get('volume_ma_period', 20))):
-                    current_bar['volume_ma'] = float(
-                        df['volume'].rolling(
-                            max(1, int(strategy_cfg.get('volume_ma_period', 20))),
-                            min_periods=max(1, int(strategy_cfg.get('volume_ma_period', 20)))
-                        ).mean().iloc[-2]
-                    )
-                else:
-                    current_bar['volume_ma'] = np.nan
 
                 st_dir = "BULL" if current_bar.get('direction_long', current_bar.get('direction', 0)) == -1 else "BEAR"
                 ema_status = "BULL" if current_bar['ema_bull'] else ("BEAR" if current_bar['ema_bear'] else "NEUTRAL")
@@ -2418,17 +2712,16 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
                 elif current_bar.get('st_bear_flip', False):
                     dashboard.print_event("SIGNAL", "SuperTrend flipped BEARISH")
                 if current_bar.get('st_bull_flip', False) or current_bar.get('st_bear_flip', False):
-                    # Telegram is a non-critical side effect: never let a notification
-                    # failure abort the bar's entry/exit evaluation.
-                    try:
-                        await handle_supertrend_flip_telegram(
+                    # Telegram is non-critical; keep network I/O off the signal/order path.
+                    notify_telegram_background(
+                        telegram,
+                        handle_supertrend_flip_telegram(
                             telegram,
                             current_bar,
                             mode_label="LIVE",
                             contract_label=active_contract_label,
-                        )
-                    except Exception as notify_err:
-                        logger.error("SuperTrend flip Telegram notify failed (continuing): %s", notify_err)
+                        ),
+                    )
                 if current_bar.get('ema_bull_cross', False):
                     dashboard.print_event("SIGNAL", "EMA Cross BULLISH")
                 elif current_bar.get('ema_bear_cross', False):
@@ -2490,16 +2783,19 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
                             pnl_dollars=pnl_dollars
                         )
 
-                        await telegram.notify_trade_closed(
-                            direction=direction,
-                            entry_price=state.entry_price,
-                            exit_price=exit_signal.exit_price,
-                            exit_reason=exit_signal.exit_type.value,
-                            pnl_points=pnl_points,
-                            pnl_dollars=pnl_dollars,
-                            contracts=contracts,
-                            trade_id=state.trade_count,
-                            entry_time=state.entry_time
+                        notify_telegram_background(
+                            telegram,
+                            telegram.notify_trade_closed(
+                                direction=direction,
+                                entry_price=state.entry_price,
+                                exit_price=exit_signal.exit_price,
+                                exit_reason=exit_signal.exit_type.value,
+                                pnl_points=pnl_points,
+                                pnl_dollars=pnl_dollars,
+                                contracts=contracts,
+                                trade_id=state.trade_count,
+                                entry_time=state.entry_time,
+                            ),
                         )
 
                         state_manager.on_exit(exit_signal)
@@ -2618,15 +2914,18 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
                             trade_id,
                         )
 
-                        await telegram.notify_trade_placed(
-                            direction=direction,
-                            entry_price=entry_signal.price,
-                            stop_loss=stop_loss,
-                            take_profit=take_profit,
-                            contracts=contracts,
-                            trigger=entry_signal.trigger,
-                            trade_id=trade_id,
-                            actual_fill_price=actual_fill_price,
+                        notify_telegram_background(
+                            telegram,
+                            telegram.notify_trade_placed(
+                                direction=direction,
+                                entry_price=entry_signal.price,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                contracts=contracts,
+                                trigger=entry_signal.trigger,
+                                trade_id=trade_id,
+                                actual_fill_price=actual_fill_price,
+                            ),
                         )
             except Exception as e:
                 logger.exception("Live on_bar_close failed: %s", e)
@@ -2642,6 +2941,18 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
             len(_df_live) if _df_live is not None else 0,
         )
         
+        if tick_bar_builder is not None:
+            tick_bar_task = asyncio.create_task(
+                run_fast_tick_bar_close_loop(
+                    mode_label="LIVE",
+                    contract_label=shared_state.get("contract_label", contract_label),
+                    feed=primary_feed,
+                    builder=tick_bar_builder,
+                    shared_state=shared_state,
+                    grace_sec=fast_tick_cfg["grace_sec"],
+                )
+            )
+
         dashboard_task = asyncio.create_task(update_dashboard_loop())
         
         # Send bot started notification via Telegram
@@ -2673,6 +2984,21 @@ async def run_live_trading_v2(config: dict, contracts: Optional[int] = None) -> 
             stop_reason = "LIVE trading stopped by user (Ctrl+C)"
 
         shared_state['running'] = False
+        try:
+            state_manager.save_state()
+            logger.info(
+                "STATE_SAVED_ON_SHUTDOWN | mode=LIVE | pendEMA_L=%s | pendEMA_S=%s | "
+                "tradedBull=%s | tradedBear=%s | position=%s",
+                state_manager.state.pending_long_ema_wait,
+                state_manager.state.pending_short_ema_wait,
+                state_manager.state.traded_in_bull_trend,
+                state_manager.state.traded_in_bear_trend,
+                state_manager.state.position_size,
+            )
+        except Exception as save_exc:
+            logger.error("Failed to save live state on shutdown: %s", save_exc)
+        if tick_bar_task is not None:
+            tick_bar_task.cancel()
         dashboard_task.cancel()
 
         await telegram.notify_bot_stopped(stop_reason)

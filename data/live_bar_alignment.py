@@ -9,8 +9,34 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .historical_loader import HistoricalDataLoader
 from indicators.ema import ema_trend_filter
+
+
+def _map_completed_1h_values(
+    df_10m: pd.DataFrame,
+    df_1h_full: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """
+    Vectorized equivalent of HistoricalDataLoader.get_1h_values_for_10m_bars.
+
+    The historical helper uses strict ``1h_ts < primary_ts``. Shifting the 1H
+    index forward by 1ns preserves that exact no-lookahead behavior at hour
+    boundaries while allowing pandas to perform the mapping in one pass.
+    """
+    available = df_1h_full[["ema", "close", "high", "low"]].copy()
+    available.index = available.index + pd.Timedelta(nanoseconds=1)
+    mapped = available.reindex(df_10m.index, method="ffill")
+    return (
+        mapped["ema"].rename("ema_1h"),
+        mapped["close"].rename("close_1h"),
+        mapped["high"].rename("high_1h"),
+        mapped["low"].rename("low_1h"),
+    )
+
+
+def _detect_new_1h_candle(df_10m: pd.DataFrame) -> pd.Series:
+    hours = pd.Series(df_10m.index.floor("h"), index=df_10m.index)
+    return (hours != hours.shift(1)).rename("is_new_1h_candle")
 
 
 def enrich_10m_with_1h_like_backtest(
@@ -40,9 +66,8 @@ def enrich_10m_with_1h_like_backtest(
     df_1h_ind = ema_trend_filter(df_1h_ohlcv["close"], ema_length)
     df_1h_full = pd.concat([df_1h_ohlcv, df_1h_ind], axis=1)
 
-    loader = HistoricalDataLoader(ib_client=None)
-    ema_1h, close_1h, high_1h, low_1h = loader.get_1h_values_for_10m_bars(df_10m, df_1h_full)
-    is_new_1h = loader.detect_new_1h_candle(df_10m)
+    ema_1h, close_1h, high_1h, low_1h = _map_completed_1h_values(df_10m, df_1h_full)
+    is_new_1h = _detect_new_1h_candle(df_10m)
 
     out = df_10m.copy()
     out = pd.concat([out, ema_1h, close_1h, high_1h, low_1h, is_new_1h], axis=1)
